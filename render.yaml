@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: research-platform-api
+    runtime: python
+    plan: free
+    # Install only what the API needs — not the Streamlit deps.
+    buildCommand: pip install -r requirements-api.txt
+    # $PORT is injected by Render; binding 0.0.0.0 is required.
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: GEMINI_API_KEY
+        sync: false        # set this in the Render dashboard, never in code
+    healthCheckPath: /
