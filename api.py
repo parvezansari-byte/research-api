@@ -53,6 +53,57 @@ def root():
 
 
 # ===========================================================================
+# MARKET INDICES  (live)
+# ===========================================================================
+_INDICES = {
+    "NIFTY 50": "^NSEI",
+    "SENSEX": "^BSESN",
+    "BANK NIFTY": "^NSEBANK",
+    "NIFTY IT": "^CNXIT",
+    "NIFTY AUTO": "^CNXAUTO",
+    "NIFTY PHARMA": "^CNXPHARMA",
+    "NIFTY FMCG": "^CNXFMCG",
+    "NIFTY METAL": "^CNXMETAL",
+}
+
+
+@app.get("/indices")
+def market_indices():
+    """Live values + daily change for the major Indian indices."""
+    import yfinance as yf
+
+    symbols = list(_INDICES.values())
+    try:
+        data = yf.download(symbols, period="5d", progress=False,
+                           auto_adjust=True, group_by="ticker", threads=True)
+    except Exception as e:
+        raise HTTPException(502, f"Index data error: {e}")
+
+    out = []
+    for name, sym in _INDICES.items():
+        try:
+            closes = data[sym]["Close"].dropna() if len(symbols) > 1 \
+                else data["Close"].dropna()
+            if closes.empty:
+                continue
+            value = float(closes.iloc[-1])
+            prev = float(closes.iloc[-2]) if len(closes) > 1 else value
+            change = value - prev
+            out.append({
+                "name": name,
+                "value": round(value, 2),
+                "change": round(change, 2),
+                "change_pct": round((change / prev * 100) if prev else 0, 2),
+            })
+        except Exception:
+            continue
+
+    if not out:
+        raise HTTPException(502, "No index data available right now")
+    return {"indices": out}
+
+
+# ===========================================================================
 # STOCKS
 # ===========================================================================
 @app.get("/stock/{symbol}")
@@ -69,6 +120,12 @@ def stock_detail(symbol: str):
 
     if not signals:
         raise HTTPException(404, f"No price data for '{symbol}'")
+
+    # Fix dividend yield units: Yahoo now returns this already as a percent
+    # (e.g. 0.46 = 0.46%), but the engine multiplies by 100 → 46%. Undo that.
+    dy = fundamentals.get("dividend_yield_pct")
+    if isinstance(dy, (int, float)) and dy > 20:
+        fundamentals["dividend_yield_pct"] = round(dy / 100, 2)
 
     return {"symbol": sym, "fundamentals": fundamentals, "technicals": signals}
 
