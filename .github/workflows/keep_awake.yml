@@ -1,0 +1,31 @@
+name: Keep API Awake
+
+# Render's free tier sleeps after 15 minutes of inactivity, which makes the
+# first request (usually login) slow or fail. This pings the API every 10
+# minutes so it never falls asleep.
+
+on:
+  schedule:
+    # every 10 minutes. GitHub cron is UTC and can run a few minutes late,
+    # but 10-min spacing stays comfortably under Render's 15-min sleep window.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:      # lets you trigger it manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the API health endpoint
+        run: |
+          echo "Pinging API at $(date -u)"
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+                 --max-time 60 \
+                 https://research-api-8a34.onrender.com/)
+          echo "HTTP status: $code"
+          # A sleeping Render service may take 30-60s to wake; that's fine,
+          # the request itself is what wakes it. Only fail on a real error.
+          if [ "$code" -ge 500 ] || [ "$code" -eq 000 ]; then
+            echo "API did not respond healthily (status $code)"
+            exit 1
+          fi
+          echo "API is awake."
