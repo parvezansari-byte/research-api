@@ -1335,3 +1335,204 @@ Rules: use ONLY the data above; invent no numbers or news. Never say whether to 
         return {"analysis": (resp.text or "").strip()}
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")
+
+
+# ===========================================================================
+# FII / DII HISTORY  (30-day daily flows)
+# ===========================================================================
+_HIST_COLS = ["date", "fii_buy", "fii_sell", "fii_net",
+              "dii_buy", "dii_sell", "dii_net"]
+
+
+def _hist_load_cache() -> list:
+    """Stored history from Supabase. Survives redeploys; empty if unconfigured."""
+    sb = _supabase()
+    if sb is None:
+        return []
+    try:
+        res = (sb.table("fii_dii_history").select("*")
+                 .order("date", desc=True).limit(120).execute())
+        return res.data or []
+    except Exception:
+        return []
+
+
+def _hist_save_cache(rows: list) -> None:
+    """Upsert merged history so tomorrow's request starts from today's data."""
+    sb = _supabase()
+    if sb is None or not rows:
+        return
+    try:
+        payload = []
+        for r in rows[:120]:
+            payload.append({k: r.get(k) for k in _HIST_COLS})
+        sb.table("fii_dii_history").upsert(
+            payload, on_conflict="date").execute()
+    except Exception:
+        pass
+
+
+def _hist_scrape_moneycontrol() -> list:
+    """
+    Moneycontrol's FII/DII activity table — current month plus the previous one.
+
+    Returns [] rather than raising: this is one of several sources, and a
+    blocked scrape shouldn't take the endpoint down.
+    """
+    import io as _io
+    from datetime import date, timedelta
+
+    try:
+        import pandas as pd
+        import requests
+    except ImportError:
+        return []
+
+    base = ("https://www.moneycontrol.com/stocks/marketstats/"
+            "fii_dii_activity/index.php")
+    prev = date.today().replace(day=1) - timedelta(days=1)
+    urls = [base,
+            f"{base}?mon_year={prev.strftime('%m-%Y')}",
+            f"{base}?mon_year={prev.strftime('%b-%Y')}"]
+
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/126.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.moneycontrol.com/",
+    })
+
+    frames = []
+    for url in urls:
+        try:
+            r = s.get(url, timeout=12)
+            r.raise_for_status()
+            for t in pd.read_html(_io.StringIO(r.text)):
+                if t.shape[1] >= 7:
+                    t = t.iloc[:, :7].copy()
+                    t.columns = _HIST_COLS
+                    frames.append(t)
+                    break
+        except Exception:
+            continue
+
+    if not frames:
+        return []
+
+    df = pd.concat(frames, ignore_index=True)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    df = df.dropna(subset=["date"])
+    for c in _HIST_COLS[1:]:
+        df[c] = pd.to_numeric(
+            df[c].astype(str).str.replace(",", ""), errors="coerce")
+    df = df.dropna(subset=["fii_net", "dii_net"])
+
+    out = []
+    for _, row in df.iterrows():
+        out.append({
+            "date": row["date"].strftime("%Y-%m-%d"),
+            **{c: (None if row[c] != row[c] else float(row[c]))
+               for c in _HIST_COLS[1:]},
+        })
+    return out
+
+
+def _hist_today_row() -> list:
+    """Pivot today's live FII/DII snapshot into a single history row."""
+    from datetime import datetime
+    try:
+        snap = fii_dii()
+    except Exception:
+        return []
+
+    flows = snap.get("flows") or []
+    fii = next((f for f in flows if str(f.get("who")).upper() == "FII"), None)
+    dii = next((f for f in flows if str(f.get("who")).upper() == "DII"), None)
+    if not fii or not dii:
+        return []
+
+    raw = str(fii.get("date") or "").strip()
+    stamp = None
+    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y"):
+        try:
+            stamp = datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+            break
+        except ValueError:
+            continue
+    if stamp is None:
+        stamp = datetime.now().strftime("%Y-%m-%d")
+
+    return [{
+        "date": stamp,
+        "fii_buy": fii.get("buy"), "fii_sell": fii.get("sell"),
+        "fii_net": fii.get("net"),
+        "dii_buy": dii.get("buy"), "dii_sell": dii.get("sell"),
+        "dii_net": dii.get("net"),
+    }]
+
+
+@app.get("/fii-dii/history")
+def fii_dii_history(days: int = 30):
+    """
+    Daily FII/DII net flows for the last [days] trading sessions.
+
+    Merges three sources — stored history, a Moneycontrol scrape, and today's
+    live snapshot — then persists the result. That way history keeps building
+    day by day even when the scrape source blocks this server, which it often
+    does from a datacenter IP.
+    """
+    cached = _hist_load_cache()
+    scraped = _hist_scrape_moneycontrol()
+    today = _hist_today_row()
+
+    merged: dict[str, dict] = {}
+    for source in (cached, scraped, today):   # later sources win
+        for row in source:
+            stamp = str(row.get("date", ""))[:10]
+            if not stamp:
+                continue
+            clean = {"date": stamp}
+            for c in _HIST_COLS[1:]:
+                try:
+                    v = row.get(c)
+                    clean[c] = None if v is None else float(v)
+                except (TypeError, ValueError):
+                    clean[c] = None
+            if clean.get("fii_net") is None and clean.get("dii_net") is None:
+                continue
+            merged[stamp] = clean
+
+    rows = sorted(merged.values(), key=lambda r: r["date"], reverse=True)
+    if rows:
+        _hist_save_cache(rows)
+
+    window = rows[:days]
+    fii_total = sum(r["fii_net"] or 0 for r in window)
+    dii_total = sum(r["dii_net"] or 0 for r in window)
+    fii_buy_days = sum(1 for r in window if (r["fii_net"] or 0) > 0)
+
+    sources = []
+    if cached:
+        sources.append("cache")
+    if scraped:
+        sources.append("moneycontrol")
+    if today:
+        sources.append("live")
+
+    return _clean({
+        "count": len(window),
+        "requested_days": days,
+        "sources": sources,
+        "summary": {
+            "fii_net_total": round(fii_total, 2),
+            "dii_net_total": round(dii_total, 2),
+            "combined_net": round(fii_total + dii_total, 2),
+            "fii_buying_days": fii_buy_days,
+            "total_days": len(window),
+        },
+        # Oldest first, so a chart can plot straight through.
+        "history": list(reversed(window)),
+    })
