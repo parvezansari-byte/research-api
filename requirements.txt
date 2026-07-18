@@ -1,10 +1,2 @@
-fastapi
-uvicorn[standard]
-pandas
+streamlit
 numpy
-requests
-yfinance
-google-genai
-supabase
-bcrypt
-dhanhq

@@ -739,6 +739,323 @@ def fund_detail(scheme_code: str):
 
 
 # ===========================================================================
+# MARKET NEWS  (free RSS, no API key)
+# ===========================================================================
+NEWS_FEEDS = {
+    "Economic Times Markets":
+        "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+    "ET Stocks":
+        "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms",
+    "Moneycontrol Markets":
+        "https://www.moneycontrol.com/rss/marketreports.xml",
+    "Moneycontrol Business":
+        "https://www.moneycontrol.com/rss/business.xml",
+    "Livemint Markets":
+        "https://www.livemint.com/rss/markets",
+    "Business Standard Markets":
+        "https://www.business-standard.com/rss/markets-106.rss",
+}
+
+_POSITIVE = ("surge", "rally", "gain", "jump", "rise", "record high", "profit",
+             "beats", "upgrade", "bullish", "soar", "growth", "strong", "boost",
+             "buy", "outperform", "up ", "hits high", "best")
+_NEGATIVE = ("fall", "drop", "crash", "plunge", "loss", "decline", "slump",
+             "downgrade", "bearish", "weak", "cuts", "misses", "sell-off",
+             "selloff", "tumble", "down ", "fears", "worst", "fraud", "probe")
+_HIGH_IMPACT = ("rbi", "sebi", "fed", "budget", "gdp", "inflation", "rate cut",
+                "rate hike", "repo", "election", "tariff", "crash", "record",
+                "nifty", "sensex", "results", "earnings", "ipo", "merger",
+                "acquisition", "crude", "rupee")
+
+
+def _sentiment(text: str) -> str:
+    t = text.lower()
+    pos = sum(w in t for w in _POSITIVE)
+    neg = sum(w in t for w in _NEGATIVE)
+    if pos > neg:
+        return "Positive"
+    if neg > pos:
+        return "Negative"
+    return "Neutral"
+
+
+def _impact(text: str) -> str:
+    hits = sum(w in text.lower() for w in _HIGH_IMPACT)
+    return "High" if hits >= 2 else ("Medium" if hits == 1 else "Low")
+
+
+def _strip_html(s: str) -> str:
+    import html as html_lib
+    import re
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    return html_lib.unescape(re.sub(r"\s+", " ", s)).strip()
+
+
+def _entry_image(entry, raw_summary: str) -> str:
+    """Article image from RSS media tags, enclosures, or an inline <img>."""
+    import re
+    try:
+        for m in getattr(entry, "media_content", []) or []:
+            url = m.get("url", "")
+            if url.startswith("http"):
+                return url
+        for m in getattr(entry, "media_thumbnail", []) or []:
+            url = m.get("url", "")
+            if url.startswith("http"):
+                return url
+        for enc in getattr(entry, "enclosures", []) or []:
+            if "image" in enc.get("type", "") and \
+                    enc.get("href", "").startswith("http"):
+                return enc["href"]
+        m = re.search(r'<img[^>]+src=["\'](http[^"\']+)["\']', raw_summary or "")
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+@app.get("/news")
+def market_news(limit: int = 60, sentiment: str = "", impact: str = ""):
+    """
+    Live market news aggregated from Indian financial RSS feeds.
+
+    Each item is tagged with a keyword-based sentiment and impact score. That
+    is a crude heuristic, not real NLP — it is there to help scanning, not to
+    be traded on.
+    """
+    from datetime import datetime, timezone
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        import feedparser
+    except ImportError:
+        raise HTTPException(
+            503, "feedparser is not installed on the server "
+                 "(add 'feedparser' to requirements.txt)")
+
+    def age(dt):
+        if dt is None:
+            return ""
+        mins = int((datetime.now(timezone.utc) - dt).total_seconds() // 60)
+        if mins < 60:
+            return f"{mins}m ago"
+        if mins < 1440:
+            return f"{mins // 60}h ago"
+        return f"{mins // 1440}d ago"
+
+    def pull(item):
+        source, url = item
+        out = []
+        try:
+            feed = feedparser.parse(url)
+            for e in feed.entries[:15]:
+                title = _strip_html(getattr(e, "title", ""))
+                if not title:
+                    continue
+                raw = getattr(e, "summary", "")
+                summary = _strip_html(raw)[:400]
+                published = None
+                for attr in ("published_parsed", "updated_parsed"):
+                    tp = getattr(e, attr, None)
+                    if tp:
+                        published = datetime(*tp[:6], tzinfo=timezone.utc)
+                        break
+                text = f"{title} {summary}"
+                out.append({
+                    "title": title,
+                    "summary": summary,
+                    "link": getattr(e, "link", ""),
+                    "source": source,
+                    "published": published.isoformat() if published else None,
+                    "age": age(published),
+                    "image": _entry_image(e, raw),
+                    "sentiment": _sentiment(text),
+                    "impact": _impact(text),
+                    "_ts": published.timestamp() if published else 0,
+                })
+        except Exception:
+            pass
+        return out
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        batches = list(pool.map(pull, NEWS_FEEDS.items()))
+
+    articles, seen = [], set()
+    for batch in batches:
+        for a in batch:
+            key = a["title"].lower()[:80]
+            if key not in seen:
+                seen.add(key)
+                articles.append(a)
+
+    if sentiment:
+        articles = [a for a in articles
+                    if a["sentiment"].lower() == sentiment.lower()]
+    if impact:
+        articles = [a for a in articles
+                    if a["impact"].lower() == impact.lower()]
+
+    articles.sort(key=lambda a: a["_ts"], reverse=True)
+    for a in articles:
+        a.pop("_ts", None)
+
+    counts = {"positive": 0, "negative": 0, "neutral": 0, "high_impact": 0}
+    for a in articles:
+        counts[a["sentiment"].lower()] += 1
+        if a["impact"] == "High":
+            counts["high_impact"] += 1
+
+    return _clean({
+        "count": len(articles[:limit]),
+        "total_fetched": len(articles),
+        "sources": list(NEWS_FEEDS),
+        "summary": counts,
+        "articles": articles[:limit],
+    })
+
+
+# ===========================================================================
+# FII / DII INSTITUTIONAL FLOWS
+# ===========================================================================
+@app.get("/fii-dii")
+def fii_dii():
+    """
+    Daily FII/DII cash-market activity in ₹ crore.
+
+    NSE blocks most datacenter IPs, so this tries several sources in order and
+    reports which one answered. `diagnostics` is included so a failure is
+    debuggable rather than silent.
+    """
+    import requests
+
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+    diag = []
+
+    def num(x):
+        try:
+            return float(str(x).replace(",", "").replace("₹", "").strip())
+        except (TypeError, ValueError):
+            return None
+
+    # ---- source 1: NSE official ----
+    try:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/reports/fii-dii",
+        })
+        warm = s.get("https://www.nseindia.com", timeout=8)
+        r = s.get("https://www.nseindia.com/api/fiidiiTradeReact", timeout=8)
+        diag.append(f"NSE: warmup {warm.status_code}, api {r.status_code}")
+        r.raise_for_status()
+        rows = []
+        for d in r.json():
+            cat = str(d.get("category", "")).upper()
+            rows.append({
+                "who": "FII" if ("FII" in cat or "FPI" in cat) else "DII",
+                "date": d.get("date", ""),
+                "buy": num(d.get("buyValue")),
+                "sell": num(d.get("sellValue")),
+                "net": num(d.get("netValue")),
+            })
+        if rows:
+            return _clean({"source": "NSE", "flows": rows,
+                           "diagnostics": diag})
+        diag.append("NSE: 200 but empty payload")
+    except Exception as e:
+        diag.append(f"NSE: {type(e).__name__}: {str(e)[:120]}")
+
+    # ---- source 2: StockEdge public API ----
+    for url in (
+        "https://api.stockedge.com/Api/FIIDailyDashboardApi/"
+        "GetLatestFIIDIIActivities?lang=en",
+        "https://api.stockedge.com/Api/DailyDashboardApi/"
+        "GetLatestFIIDIIActivity?lang=en",
+    ):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA,
+                                           "Accept": "application/json"},
+                             timeout=10)
+            diag.append(f"StockEdge {url.split('/')[-1][:26]}: {r.status_code}")
+            r.raise_for_status()
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            rows = []
+            for d in items:
+                if not isinstance(d, dict):
+                    continue
+                blob = {str(k).lower(): v for k, v in d.items()}
+                who_raw = str(blob.get("name") or blob.get("category")
+                              or blob.get("clienttype") or "").upper()
+                who = "FII" if ("FII" in who_raw or "FPI" in who_raw) else (
+                      "DII" if "DII" in who_raw else None)
+                if not who:
+                    continue
+                buy = num(blob.get("buyvalue") or blob.get("grosspurchase")
+                          or blob.get("buy"))
+                sell = num(blob.get("sellvalue") or blob.get("grosssales")
+                           or blob.get("sell"))
+                net = num(blob.get("netvalue") or blob.get("net"))
+                if net is None and buy is not None and sell is not None:
+                    net = buy - sell
+                rows.append({
+                    "who": who,
+                    "date": str(blob.get("date") or blob.get("tradedate") or ""),
+                    "buy": buy, "sell": sell, "net": net,
+                })
+            rows = [r_ for r_ in rows if r_["net"] is not None]
+            if rows:
+                # Keep the most recent row per participant.
+                seen, unique = set(), []
+                for r_ in rows:
+                    if r_["who"] not in seen:
+                        seen.add(r_["who"])
+                        unique.append(r_)
+                return _clean({"source": "StockEdge", "flows": unique,
+                               "diagnostics": diag})
+        except Exception as e:
+            diag.append(f"StockEdge: {type(e).__name__}: {str(e)[:100]}")
+
+    # ---- source 3: Moneycontrol HTML table ----
+    try:
+        r = requests.get(
+            "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/",
+            headers={"User-Agent": UA}, timeout=12)
+        diag.append(f"Moneycontrol: {r.status_code}")
+        r.raise_for_status()
+        import pandas as pd
+        from io import StringIO
+        tables = pd.read_html(StringIO(r.text))
+        for t in tables:
+            cols = [str(c).lower() for c in t.columns]
+            if any("gross purchase" in c or "buy" in c for c in cols) and len(t) >= 2:
+                rows = []
+                for _, row in t.head(2).iterrows():
+                    vals = [num(v) for v in row.tolist()[1:4]]
+                    label = str(row.tolist()[0]).upper()
+                    who = "FII" if ("FII" in label or "FPI" in label) else "DII"
+                    if len(vals) >= 3:
+                        rows.append({"who": who, "date": "",
+                                     "buy": vals[0], "sell": vals[1],
+                                     "net": vals[2]})
+                if rows:
+                    return _clean({"source": "Moneycontrol", "flows": rows,
+                                   "diagnostics": diag})
+        diag.append("Moneycontrol: no matching table")
+    except Exception as e:
+        diag.append(f"Moneycontrol: {type(e).__name__}: {str(e)[:100]}")
+
+    raise HTTPException(
+        503,
+        "FII/DII data is unavailable right now — every upstream source "
+        f"refused. Diagnostics: {' | '.join(diag)}")
+
+
+# ===========================================================================
 # PORTFOLIO DOCTOR  (your unique feature)
 # ===========================================================================
 class Holding(BaseModel):
