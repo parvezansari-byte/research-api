@@ -135,6 +135,206 @@ def market_indices():
     return _clean({"indices": out})
 
 
+# ===========================================================================
+# STOCK UNIVERSE  (multi-source, never hard-fails)
+# ===========================================================================
+#
+# NSE blocks most datacenter IPs, so a single fetch from nseindia.com fails
+# from Render even though it works locally. This tries several hosts in turn
+# and falls back to a static list, so the search box is always populated even
+# when every network source refuses.
+
+_UNIVERSE_SOURCES = {
+    "LARGECAP": [
+        "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv",
+        "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv",
+    ],
+    "MIDCAP": [
+        "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv",
+        "https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
+    ],
+    "SMALLCAP": [
+        "https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv",
+        "https://archives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+    ],
+}
+
+# Static safety nets. Not the full index — enough that search stays useful
+# when every remote source is blocked.
+_NIFTY50_FALLBACK = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR", "ITC",
+    "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "AXISBANK", "ASIANPAINT",
+    "MARUTI", "TITAN", "SUNPHARMA", "ULTRACEMCO", "BAJFINANCE", "NESTLEIND",
+    "WIPRO", "HCLTECH", "ONGC", "NTPC", "POWERGRID", "M&M", "TATAMOTORS",
+    "TATASTEEL", "JSWSTEEL", "ADANIENT", "ADANIPORTS", "COALINDIA", "GRASIM",
+    "HINDALCO", "DRREDDY", "CIPLA", "DIVISLAB", "BRITANNIA", "EICHERMOT",
+    "HEROMOTOCO", "BAJAJ-AUTO", "BAJAJFINSV", "INDUSINDBK", "TECHM", "SHREECEM",
+    "UPL", "APOLLOHOSP", "TATACONSUM", "SBILIFE", "HDFCLIFE", "BPCL",
+]
+
+_MIDCAP_FALLBACK = [
+    "ASHOKLEY", "AUBANK", "AUROPHARMA", "BALKRISIND", "BANDHANBNK", "BEL",
+    "BHARATFORG", "BHEL", "BIOCON", "CANBK", "CHOLAFIN", "COFORGE",
+    "COLPAL", "CONCOR", "CUMMINSIND", "DALBHARAT", "DIXON", "ESCORTS",
+    "FEDERALBNK", "GMRINFRA", "GODREJPROP", "GUJGASLTD", "HAL", "HAVELLS",
+    "IDFCFIRSTB", "INDHOTEL", "INDIGO", "IRCTC", "JINDALSTEL", "JUBLFOOD",
+    "LICHSGFIN", "LTIM", "LUPIN", "MFSL", "MPHASIS", "MRF", "MUTHOOTFIN",
+    "NMDC", "OBEROIRLTY", "OFSS", "PAGEIND", "PERSISTENT", "PETRONET",
+    "PFC", "PIIND", "PNB", "POLYCAB", "RECLTD", "SAIL", "SRF", "SUNTV",
+    "SUPREMEIND", "SYNGENE", "TATACHEM", "TATACOMM", "TATAELXSI", "TATAPOWER",
+    "TORNTPHARM", "TRENT", "TVSMOTOR", "UBL", "VOLTAS", "ZEEL", "ZYDUSLIFE",
+    "ABCAPITAL", "ALKEM", "APLAPOLLO", "ASTRAL", "BATAINDIA", "CROMPTON",
+    "DEEPAKNTR", "GLAND", "GLENMARK", "GODREJCP", "HINDPETRO", "IDEA",
+    "IPCALAB", "L&TFH", "M&MFIN", "MANAPPURAM", "MAXHEALTH", "METROPOLIS",
+    "NAM-INDIA", "NAVINFLUOR", "OIL", "PEL", "PHOENIXLTD", "RAMCOCEM",
+    "SHRIRAMFIN", "SONACOMS", "STARHEALTH", "THERMAX", "UNIONBANK",
+]
+
+_SMALLCAP_FALLBACK = [
+    "AARTIIND", "AAVAS", "ABFRL", "ACE", "AEGISCHEM", "AFFLE", "AJANTPHARM",
+    "ALLCARGO", "AMARAJABAT", "ANGELONE", "APARINDS", "APTUS", "ASAHIINDIA",
+    "ASTERDM", "ATUL", "BALAMINES", "BALRAMCHIN", "BASF", "BIRLACORPN",
+    "BLUEDART", "BLUESTARCO", "BSOFT", "CAMS", "CANFINHOME", "CAPLIPOINT",
+    "CARBORUNIV", "CASTROLIND", "CDSL", "CEATLTD", "CENTRALBK", "CENTURYPLY",
+    "CERA", "CHAMBLFERT", "CHOLAHLDNG", "CIEINDIA", "CLEAN", "CSBBANK",
+    "CYIENT", "DATAPATTNS", "DCMSHRIRAM", "DELTACORP", "DEVYANI", "DHANI",
+    "EIDPARRY", "EIHOTEL", "ELGIEQUIP", "EMAMILTD", "ENDURANCE", "ENGINERSIN",
+    "EQUITASBNK", "EXIDEIND", "FDC", "FINCABLES", "FINEORG", "FINPIPE",
+    "FORTIS", "FSL", "GALAXYSURF", "GESHIP", "GILLETTE", "GNFC", "GODFRYPHLP",
+    "GRANULES", "GRAPHITE", "GRINDWELL", "GSFC", "GSPL", "HAPPSTMNDS",
+    "HATSUN", "HEG", "HFCL", "HINDCOPPER", "HOMEFIRST", "HUDCO", "IBULHSGFIN",
+    "IEX", "IIFL", "INDIACEM", "INDIAMART", "INTELLECT", "IOB", "IRB",
+    "IRCON", "ITI", "JBCHEPHARM", "JKCEMENT", "JKLAKSHMI", "JKPAPER",
+    "JMFINANCIL", "JSWENERGY", "JUBLINGREA", "JUSTDIAL", "JYOTHYLAB",
+    "KAJARIACER", "KALYANKJIL", "KANSAINER", "KARURVYSYA", "KEC", "KEI",
+    "KIRLOSENG", "KNRCON", "KPITTECH", "KRBL", "LATENTVIEW", "LAURUSLABS",
+    "LEMONTREE", "LINDEINDIA", "LXCHEM", "MAHABANK", "MAHLIFE", "MAPMYINDIA",
+    "MASTEK", "MEDPLUS", "MGL", "MIDHANI", "MINDACORP", "MOTILALOFS",
+    "MRPL", "NATCOPHARM", "NATIONALUM", "NBCC", "NCC", "NESCO", "NETWORK18",
+    "NH", "NIACL", "NLCINDIA", "NUVOCO", "OLECTRA", "ORIENTELEC", "PGHH",
+    "PNBHOUSING", "POLYMED", "POONAWALLA", "PRAJIND", "PRESTIGE", "PRINCEPIPE",
+    "PRSMJOHNSN", "PVRINOX", "QUESS", "RADICO", "RAILTEL", "RAIN", "RAJESHEXPO",
+    "RALLIS", "RATNAMANI", "RBLBANK", "RCF", "REDINGTON", "RELAXO", "RENUKA",
+    "RITES", "ROUTE", "RVNL", "SANOFI", "SAPPHIRE", "SCHAEFFLER", "SFL",
+    "SHARDACROP", "SHOPERSTOP", "SHYAMMETL", "SIS", "SJVN", "SOBHA",
+    "SOLARINDS", "SONATSOFTW", "SPARC", "STLTECH", "SUMICHEM", "SUNCLAYLTD",
+    "SUNDARMFIN", "SUNDRMFAST", "SUPRAJIT", "SUVENPHAR", "SWANENERGY",
+    "SYMPHONY", "TANLA", "TATAINVEST", "TCIEXP", "TEAMLEASE", "TEJASNET",
+    "TIINDIA", "TIMKEN", "TRIDENT", "TRITURBINE", "TTKPRESTIG", "TV18BRDCST",
+    "UJJIVANSFB", "UTIAMC", "VAIBHAVGBL", "VAKRANGEE", "VARROC", "VBL",
+    "VGUARD", "VINATIORGA", "VIPIND", "VTL", "WELCORP", "WELSPUNIND",
+    "WESTLIFE", "WHIRLPOOL", "ZENSARTECH", "ZFCVINDIA", "ZYDUSWELL",
+]
+
+_STATIC_FALLBACKS = {
+    "LARGECAP": _NIFTY50_FALLBACK,
+    "MIDCAP": _MIDCAP_FALLBACK,
+    "SMALLCAP": _SMALLCAP_FALLBACK,
+}
+
+# Rough floors — a truncated or error page shouldn't pass as a real list.
+_MIN_EXPECTED = {"LARGECAP": 80, "MIDCAP": 100, "SMALLCAP": 150}
+
+# Populated on first success; avoids re-downloading on every request.
+_universe_cache: dict[str, list[str]] = {}
+
+
+def _fetch_constituents(url: str) -> list[str]:
+    """Pull a symbol column out of an NSE-style constituents CSV."""
+    import csv
+    import io
+    import requests
+
+    r = requests.get(
+        url,
+        headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/126.0 Safari/537.36"),
+            "Accept": "text/csv,application/csv,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.niftyindices.com/",
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+
+    text = r.text
+    if "<html" in text[:400].lower():
+        raise ValueError("got an HTML page, not a CSV")
+
+    reader = csv.DictReader(io.StringIO(text))
+    field = None
+    for candidate in ("Symbol", "SYMBOL", "symbol"):
+        if reader.fieldnames and candidate in reader.fieldnames:
+            field = candidate
+            break
+    if field is None:
+        raise ValueError(f"no Symbol column in {reader.fieldnames}")
+
+    out = []
+    for row in reader:
+        sym = (row.get(field) or "").strip().upper()
+        if sym:
+            out.append(sym)
+    return out
+
+
+def _universe_symbols(universe: str) -> tuple[list[str], str]:
+    """
+    Symbols for one universe, plus where they came from.
+
+    Order of preference: in-process cache, then each remote source in turn,
+    then the static list. Returning the origin makes it visible in the API
+    response whether the data is live or a fallback.
+    """
+    universe = universe.upper()
+
+    if universe in _universe_cache:
+        return _universe_cache[universe], "cache"
+
+    minimum = _MIN_EXPECTED.get(universe, 40)
+    for url in _UNIVERSE_SOURCES.get(universe, []):
+        try:
+            symbols = _fetch_constituents(url)
+            if len(symbols) >= minimum:
+                _universe_cache[universe] = symbols
+                host = url.split("/")[2]
+                return symbols, host
+        except Exception:
+            continue
+
+    # Last resort: the analysis module's own logic, in case it has a
+    # locally cached copy from a previous successful run.
+    try:
+        from analysis_api import get_universe
+        symbols = [s.replace(".NS", "") for s in get_universe(universe)]
+        if len(symbols) >= minimum:
+            _universe_cache[universe] = symbols
+            return symbols, "analysis_api"
+    except Exception:
+        pass
+
+    return list(_STATIC_FALLBACKS.get(universe, [])), "static"
+
+
+@app.get("/debug/universe")
+def debug_universe():
+    """Where each universe's symbols are coming from, and how many."""
+    out = {}
+    for uni in ("LARGECAP", "MIDCAP", "SMALLCAP"):
+        symbols, origin = _universe_symbols(uni)
+        out[uni] = {
+            "count": len(symbols),
+            "source": origin,
+            "sample": symbols[:5],
+        }
+    return out
+
+
 @app.get("/stocks/list")
 def stock_list():
     """
@@ -142,26 +342,28 @@ def stock_list():
     Smallcap 250. Just the symbols — full data loads when a stock is opened.
     Cached implicitly by clients; the list changes rarely.
     """
-    from analysis_api import get_universe
-
     names: list[str] = []
     seen = set()
+    sources: list[str] = []
+
     for uni in ("LARGECAP", "MIDCAP", "SMALLCAP"):
-        try:
-            for sym in get_universe(uni):
-                s = sym.replace(".NS", "")
-                if s not in seen:
-                    seen.add(s)
-                    names.append(s)
-        except Exception:
-            continue
+        symbols, origin = _universe_symbols(uni)
+        if symbols:
+            sources.append(f"{uni}:{origin}({len(symbols)})")
+        for sym in symbols:
+            s = sym.replace(".NS", "").strip().upper()
+            if s and s not in seen:
+                seen.add(s)
+                names.append(s)
 
-    # fallback so the endpoint never returns empty if NSE blocks the fetch
+    # Should never happen — _universe_symbols always has a static fallback —
+    # but a search box with zero options is worse than a short list.
     if not names:
-        names = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "ITC",
-                 "SBIN", "BHARTIARTL", "LT", "KOTAKBANK"]
+        names = list(_NIFTY50_FALLBACK)
+        sources.append("emergency")
 
-    return {"count": len(names), "symbols": sorted(names)}
+    return {"count": len(names), "symbols": sorted(names),
+            "sources": sources}
 
 
 @app.get("/quote/{symbol}")
