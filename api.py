@@ -667,3 +667,15 @@ Rules: use ONLY the data above; invent no numbers or news. Never say whether to 
         return {"analysis": (resp.text or "").strip()}
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")
+
+
+@app.get("/debug/universe")
+def debug_universe():
+    from analysis_api import get_universe
+    out = {}
+    for uni in ("LARGECAP", "MIDCAP", "SMALLCAP"):
+        try:
+            out[uni] = len(get_universe(uni))
+        except Exception as e:
+            out[uni] = f"{type(e).__name__}: {e}"
+    return out
