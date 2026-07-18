@@ -1,2 +1,14 @@
-streamlit
+﻿fastapi
+uvicorn[standard]
+pandas
 numpy
+requests
+yfinance
+google-genai
+supabase
+bcrypt
+dhanhq
+feedparser
+lxml
+html5lib
+beautifulsoup4
