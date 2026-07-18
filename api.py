@@ -428,3 +428,26 @@ Rules: use ONLY the data above; invent no numbers or news. Never say whether to 
         return {"analysis": (resp.text or "").strip()}
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")
+@app.get("/debug/dhan")
+def debug_dhan(symbol: str = "RELIANCE"):
+    """Diagnostics for the Dhan connection."""
+    import os
+    report = {
+        "env": {k: bool(os.environ.get(k)) for k in
+                ("DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN")},
+        "import_ok": False, "client_ok": False,
+        "security_id": None, "ltp": None, "error": None,
+    }
+    try:
+        from dhanhq_api import get_dhan_client
+        report["import_ok"] = True
+        client = get_dhan_client()
+        report["client_ok"] = client is not None
+        if client is not None:
+            sec_id = client.get_security_id(symbol.strip().upper())
+            report["security_id"] = sec_id
+            if sec_id:
+                report["ltp"] = client.get_ltp(sec_id)
+    except Exception as e:
+        report["error"] = f"{type(e).__name__}: {e}"
+    return report
