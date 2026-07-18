@@ -383,8 +383,11 @@ def fund_detail(scheme_code: str):
     except Exception as e:
         raise HTTPException(502, f"Fund fetch failed: {e}")
 
+    # ~2000 daily observations covers roughly eight years, enough to compute
+    # 3Y and 5Y CAGR client-side. 400 only reached about 18 months, which made
+    # the longer return windows permanently unavailable.
     return {"meta": payload.get("meta", {}),
-            "nav_history": payload.get("data", [])[:400]}
+            "nav_history": payload.get("data", [])[:2000]}
 
 
 # ===========================================================================
@@ -667,15 +670,3 @@ Rules: use ONLY the data above; invent no numbers or news. Never say whether to 
         return {"analysis": (resp.text or "").strip()}
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")
-
-
-@app.get("/debug/universe")
-def debug_universe():
-    from analysis_api import get_universe
-    out = {}
-    for uni in ("LARGECAP", "MIDCAP", "SMALLCAP"):
-        try:
-            out[uni] = len(get_universe(uni))
-        except Exception as e:
-            out[uni] = f"{type(e).__name__}: {e}"
-    return out
