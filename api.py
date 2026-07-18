@@ -1376,6 +1376,179 @@ def sector_performance(compare: str = "1y"):
 
 
 # ===========================================================================
+# LIVE CHART
+# ===========================================================================
+#
+# Intraday and historical price series for charting. Separate from
+# /stock/{symbol}/history, which is daily-only and carries indicators — this
+# one is optimised for drawing a line and knowing what changed.
+
+# period/interval pairs Yahoo accepts for each timeframe.
+CHART_TIMEFRAMES = {
+    "1D":  {"period": "1d",  "interval": "1m",  "live": True},
+    "1W":  {"period": "5d",  "interval": "15m", "live": False},
+    "1M":  {"period": "1mo", "interval": "60m", "live": False},
+    "6M":  {"period": "6mo", "interval": "1d",  "live": False},
+    "1Y":  {"period": "1y",  "interval": "1d",  "live": False},
+    "5Y":  {"period": "5y",  "interval": "1wk", "live": False},
+    "ALL": {"period": "max", "interval": "1mo", "live": False},
+}
+
+# Handy names the app shows as chips. Indices keep their ^ prefix.
+CHART_QUICK_PICKS = {
+    "NIFTY 50": "^NSEI",
+    "BANK NIFTY": "^NSEBANK",
+    "SENSEX": "^BSESN",
+    "RELIANCE": "RELIANCE.NS",
+    "HDFC BANK": "HDFCBANK.NS",
+    "TCS": "TCS.NS",
+    "INFOSYS": "INFY.NS",
+    "ICICI BANK": "ICICIBANK.NS",
+}
+
+
+def _normalise_chart_symbol(symbol: str) -> str:
+    """Accept 'RELIANCE', 'RELIANCE.NS' or '^NSEI' and return a Yahoo ticker."""
+    s = symbol.strip().upper()
+    if s.startswith("^"):
+        return s
+    if s.endswith((".NS", ".BO")):
+        return s
+    return f"{s}.NS"
+
+
+@app.get("/chart/quick-picks")
+def chart_quick_picks():
+    """Preset symbols for the chart's chip row."""
+    return {"picks": [{"label": k, "symbol": v}
+                      for k, v in CHART_QUICK_PICKS.items()],
+            "timeframes": list(CHART_TIMEFRAMES.keys())}
+
+
+@app.get("/chart/{symbol}")
+def chart_data(symbol: str, timeframe: str = "1D"):
+    """
+    Price series for one symbol over one timeframe.
+
+    On the 1D view the baseline is the previous close, so the change shown
+    matches what every broker quotes. On longer views the baseline is the
+    first point in the window, so the change describes that window.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    tf = timeframe.upper()
+    if tf not in CHART_TIMEFRAMES:
+        raise HTTPException(
+            400, f"timeframe must be one of: {', '.join(CHART_TIMEFRAMES)}")
+
+    cfg = CHART_TIMEFRAMES[tf]
+    sym = _normalise_chart_symbol(symbol)
+
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise HTTPException(503, "yfinance is not installed on the server")
+
+    try:
+        ticker = yf.Ticker(sym)
+        df = ticker.history(period=cfg["period"], interval=cfg["interval"])
+
+        # 1-minute NSE data is patchy; 5-minute is a reliable stand-in.
+        used_interval = cfg["interval"]
+        if df.empty and cfg["interval"] == "1m":
+            df = ticker.history(period=cfg["period"], interval="5m")
+            used_interval = "5m"
+
+        # A fresh session before the open returns nothing — show the last day.
+        if df.empty and tf == "1D":
+            df = ticker.history(period="5d", interval="15m")
+            used_interval = "15m"
+    except Exception as e:
+        raise HTTPException(502, f"Chart data error: {e}")
+
+    if df.empty or "Close" not in df.columns:
+        raise HTTPException(
+            404,
+            f"No chart data for '{symbol}'. NSE stocks need no suffix "
+            "(RELIANCE), indices start with ^ (^NSEI).")
+
+    closes = df["Close"].dropna()
+    if closes.empty:
+        raise HTTPException(404, f"No usable prices for '{symbol}'")
+
+    # Previous close matters only on the intraday view.
+    prev_close = None
+    if cfg["live"]:
+        try:
+            prev_close = float(ticker.fast_info["previous_close"])
+        except Exception:
+            try:
+                daily = ticker.history(period="5d")["Close"].dropna()
+                if len(daily) >= 2:
+                    prev_close = float(daily.iloc[-2])
+            except Exception:
+                pass
+
+    # Timestamps to IST so the app doesn't have to guess the market's clock.
+    ist = timezone(timedelta(hours=5, minutes=30))
+    points = []
+    for stamp, value in closes.items():
+        try:
+            when = stamp.to_pydatetime()
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            when = when.astimezone(ist)
+        except Exception:
+            continue
+        points.append({
+            "t": when.isoformat(),
+            "label": when.strftime("%H:%M" if cfg["live"] else "%d %b %y"),
+            "close": round(float(value), 2),
+        })
+
+    if not points:
+        raise HTTPException(404, f"No usable prices for '{symbol}'")
+
+    last = points[-1]["close"]
+    first = points[0]["close"]
+    baseline = prev_close if (cfg["live"] and prev_close) else first
+    change = last - baseline
+    change_pct = (change / baseline * 100) if baseline else 0.0
+
+    values = [p["close"] for p in points]
+    high, low = max(values), min(values)
+
+    # Meta name is nicer than the raw ticker where Yahoo provides it.
+    display = sym.replace(".NS", "").replace(".BO", "")
+    try:
+        info_name = ticker.fast_info.get("shortName")
+        if info_name:
+            display = str(info_name)
+    except Exception:
+        pass
+
+    return _clean({
+        "symbol": sym,
+        "display": display,
+        "timeframe": tf,
+        "interval": used_interval,
+        "live": cfg["live"],
+        "last": round(last, 2),
+        "baseline": round(baseline, 2) if baseline else None,
+        "baseline_label": "prev close" if (cfg["live"] and prev_close)
+                          else f"start of {tf}",
+        "change": round(change, 2),
+        "change_pct": round(change_pct, 2),
+        "high": round(high, 2),
+        "low": round(low, 2),
+        "range_pct": round((high - low) / low * 100, 2) if low else None,
+        "points": len(points),
+        "series": points,
+        "updated": datetime.now(ist).strftime("%H:%M:%S"),
+    })
+
+
+# ===========================================================================
 # PORTFOLIO DOCTOR  (your unique feature)
 # ===========================================================================
 class Holding(BaseModel):
