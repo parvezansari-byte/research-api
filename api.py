@@ -369,6 +369,354 @@ def fund_search(q: str):
         raise HTTPException(502, f"Fund search failed: {e}")
 
 
+# ===========================================================================
+# FUND CATEGORIES
+# ===========================================================================
+#
+# mfapi's scheme list carries no category field — category only appears in the
+# per-scheme `meta`, so grouping all ~10,000 schemes would need ~10,000 calls.
+#
+# Instead each category is defined by search terms. We resolve them against
+# mfapi's own search endpoint at request time, then keep direct-growth plans.
+# That way the scheme codes are never stale or hand-typed, and new funds show
+# up on their own.
+FUND_CATEGORIES: dict[str, list[str]] = {
+    "Large Cap": ["large cap fund", "bluechip fund", "top 100 fund"],
+    "Mid Cap": ["midcap fund", "mid cap fund"],
+    "Small Cap": ["small cap fund", "smallcap fund"],
+    "Flexi Cap": ["flexi cap fund", "flexicap fund"],
+    "Large & Mid Cap": ["large and mid cap", "large & midcap", "equity opportunities"],
+    "ELSS (Tax Saving)": ["elss tax saver", "tax saver fund", "long term equity fund"],
+    "Index / Passive": ["nifty 50 index fund", "sensex index fund", "nifty next 50 index"],
+    "Hybrid / Balanced": ["balanced advantage fund", "aggressive hybrid fund", "multi asset allocation"],
+    "Debt / Short Duration": ["short duration fund", "short term fund", "corporate bond fund"],
+}
+
+# How many schemes to analyse per category. Each is a separate upstream call,
+# so this trades completeness for a response that returns in a few seconds.
+_FUNDS_PER_CATEGORY = 12
+
+
+def _is_direct_growth(name: str) -> bool:
+    """Prefer direct growth plans — same fund, lower expense ratio."""
+    low = name.lower()
+    return "direct" in low and "growth" in low and "idcw" not in low \
+        and "dividend" not in low
+
+
+def _cagr(start: float, end: float, years: float):
+    """Annualised growth, or None when the inputs can't support it."""
+    if start <= 0 or end <= 0 or years <= 0:
+        return None
+    return round(((end / start) ** (1 / years) - 1) * 100, 2)
+
+
+def _analyse_nav(data: list) -> dict:
+    """
+    Turn mfapi's NAV series into headline return figures.
+
+    `data` arrives newest-first as [{"date": "dd-mm-yyyy", "nav": "123.45"}].
+    """
+    from datetime import datetime
+
+    points = []
+    for row in data:
+        try:
+            d = datetime.strptime(row["date"], "%d-%m-%Y")
+            n = float(row["nav"])
+            if n > 0:
+                points.append((d, n))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    if not points:
+        return {}
+
+    points.sort(key=lambda p: p[0], reverse=True)
+    latest_date, latest_nav = points[0]
+    oldest_date, oldest_nav = points[-1]
+
+    def nav_years_ago(years: int):
+        try:
+            target = latest_date.replace(year=latest_date.year - years)
+        except ValueError:            # 29 Feb
+            target = latest_date.replace(year=latest_date.year - years, day=28)
+        if oldest_date > target:
+            return None
+        best, best_gap = None, None
+        for d, n in points:
+            gap = abs((d - target).days)
+            if best_gap is None or gap < best_gap:
+                best, best_gap = (d, n), gap
+        return best if best_gap is not None and best_gap <= 60 else None
+
+    def ret(years: int):
+        past = nav_years_ago(years)
+        if past is None:
+            return None
+        actual = (latest_date - past[0]).days / 365.25
+        return _cagr(past[1], latest_nav, actual)
+
+    # Volatility and drawdown from month-end NAVs.
+    monthly, seen = [], set()
+    for d, n in reversed(points):
+        key = (d.year, d.month)
+        if key not in seen:
+            seen.add(key)
+            monthly.append(n)
+
+    vol = None
+    if len(monthly) >= 13:
+        rets = [monthly[i] / monthly[i - 1] - 1 for i in range(1, len(monthly))]
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        vol = round((var ** 0.5) * (12 ** 0.5) * 100, 2)
+
+    peak, max_dd = 0.0, 0.0
+    for n in monthly:
+        peak = max(peak, n)
+        if peak > 0:
+            max_dd = min(max_dd, (n - peak) / peak)
+
+    inception_years = (latest_date - oldest_date).days / 365.25
+
+    return {
+        "latest_nav": round(latest_nav, 4),
+        "nav_date": latest_date.strftime("%d-%m-%Y"),
+        "return_1y": ret(1),
+        "return_3y": ret(3),
+        "return_5y": ret(5),
+        "since_inception": _cagr(oldest_nav, latest_nav, inception_years)
+        if inception_years >= 1 else None,
+        "volatility": vol,
+        "max_drawdown": round(max_dd * 100, 2) if max_dd < 0 else None,
+        "history_years": round(inception_years, 1),
+    }
+
+
+@app.get("/funds/categories")
+def fund_categories():
+    """The category names available to browse."""
+    return {"categories": list(FUND_CATEGORIES.keys())}
+
+
+@app.get("/funds/category/{category}")
+def funds_by_category(category: str, sort: str = "return_3y"):
+    """
+    Live returns for the leading funds in one category, ranked.
+
+    Scheme codes are resolved from mfapi's search endpoint rather than stored,
+    so the list stays current without maintenance.
+    """
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+
+    matched = None
+    for name in FUND_CATEGORIES:
+        if name.lower() == category.lower():
+            matched = name
+            break
+    if matched is None:
+        raise HTTPException(
+            404, f"Unknown category '{category}'. "
+                 f"Options: {', '.join(FUND_CATEGORIES)}")
+
+    # --- resolve scheme codes from search terms ---
+    seen_codes: dict[str, str] = {}
+    for term in FUND_CATEGORIES[matched]:
+        try:
+            r = requests.get("https://api.mfapi.in/mf/search",
+                             params={"q": term}, timeout=12)
+            if r.status_code != 200:
+                continue
+            for row in r.json():
+                name = str(row.get("schemeName", ""))
+                code = str(row.get("schemeCode", ""))
+                if code and _is_direct_growth(name) and code not in seen_codes:
+                    seen_codes[code] = name
+        except Exception:
+            continue
+        if len(seen_codes) >= _FUNDS_PER_CATEGORY * 2:
+            break
+
+    if not seen_codes:
+        raise HTTPException(
+            502, f"Could not resolve any schemes for '{matched}'")
+
+    codes = list(seen_codes)[:_FUNDS_PER_CATEGORY]
+
+    def fetch(code: str):
+        try:
+            r = requests.get(f"https://api.mfapi.in/mf/{code}", timeout=12)
+            if r.status_code != 200:
+                return None
+            payload = r.json()
+            meta = payload.get("meta") or {}
+            stats = _analyse_nav(payload.get("data") or [])
+            if not stats:
+                return None
+            return {
+                "scheme_code": code,
+                "name": meta.get("scheme_name", seen_codes.get(code, "Unknown")),
+                "fund_house": meta.get("fund_house", "—"),
+                "category": meta.get("scheme_category", matched),
+                **stats,
+            }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = [f for f in pool.map(fetch, codes) if f]
+
+    key = sort if sort in {"return_1y", "return_3y", "return_5y",
+                           "since_inception", "volatility"} else "return_3y"
+    # Funds missing the sort window sink to the bottom rather than erroring.
+    # Volatility sorts ascending — less risk ranks better.
+    if key == "volatility":
+        results.sort(key=lambda f: (f.get(key) is None, f.get(key) or 1e9))
+    else:
+        results.sort(key=lambda f: (f.get(key) is None, -(f.get(key) or 0)))
+
+    return _clean({"category": matched, "count": len(results),
+                   "funds": results})
+
+
+@app.get("/funds/{scheme_code}/analysis")
+def fund_analysis(scheme_code: str):
+    """Full stats for one scheme, including a downsampled NAV series."""
+    import requests
+    try:
+        r = requests.get(f"https://api.mfapi.in/mf/{scheme_code}", timeout=15)
+        if r.status_code != 200:
+            raise HTTPException(404, "Scheme not found")
+        payload = r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Fund fetch failed: {e}")
+
+    data = payload.get("data") or []
+    stats = _analyse_nav(data)
+    if not stats:
+        raise HTTPException(422, "No usable NAV history for this scheme")
+
+    # Roughly 120 points is enough to draw a smooth chart.
+    step = max(len(data) // 120, 1)
+    chart = [{"date": row["date"], "nav": float(row["nav"])}
+             for row in data[::step][:120]
+             if row.get("nav") not in (None, "")]
+
+    return _clean({
+        "meta": payload.get("meta", {}),
+        **stats,
+        "chart": list(reversed(chart)),
+    })
+
+
+@app.get("/funds/{scheme_code}/sip-backtest")
+def fund_sip_backtest(scheme_code: str, monthly: float = 10000,
+                      years: int = 5):
+    """
+    What a monthly SIP into this scheme would actually have been worth.
+
+    Uses real historical NAVs: each month buys units at that month's NAV, and
+    the final value is total units times the latest NAV.
+    """
+    import requests
+    from datetime import datetime
+
+    try:
+        r = requests.get(f"https://api.mfapi.in/mf/{scheme_code}", timeout=15)
+        if r.status_code != 200:
+            raise HTTPException(404, "Scheme not found")
+        payload = r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Fund fetch failed: {e}")
+
+    points = []
+    for row in payload.get("data") or []:
+        try:
+            points.append((datetime.strptime(row["date"], "%d-%m-%Y"),
+                           float(row["nav"])))
+        except (KeyError, ValueError, TypeError):
+            continue
+    if not points:
+        raise HTTPException(422, "No usable NAV history")
+
+    points.sort(key=lambda p: p[0])
+    latest_date, latest_nav = points[-1]
+
+    try:
+        start = latest_date.replace(year=latest_date.year - years)
+    except ValueError:
+        start = latest_date.replace(year=latest_date.year - years, day=28)
+    if points[0][0] > start:
+        raise HTTPException(
+            422, f"This scheme has less than {years} years of history")
+
+    # First NAV on or after each monthly instalment date.
+    units, invested, rows = 0.0, 0.0, []
+    cursor = start
+    while cursor <= latest_date:
+        buy = next((p for p in points if p[0] >= cursor), None)
+        if buy is None:
+            break
+        units += monthly / buy[1]
+        invested += monthly
+        rows.append({
+            "date": buy[0].strftime("%d-%m-%Y"),
+            "nav": round(buy[1], 4),
+            "invested": round(invested, 2),
+            "value": round(units * buy[1], 2),
+        })
+        month = cursor.month + 1
+        year = cursor.year + (1 if month > 12 else 0)
+        month = 1 if month > 12 else month
+        day = min(cursor.day, 28)
+        cursor = cursor.replace(year=year, month=month, day=day)
+
+    if not rows:
+        raise HTTPException(422, "Could not build a SIP schedule")
+
+    final_value = units * latest_nav
+    gain = final_value - invested
+
+    # Money-weighted return: solve for the rate that grows the instalments to
+    # the observed value, rather than quoting a simple gain percentage.
+    def sip_fv(rate: float) -> float:
+        rr = rate / 12
+        n = len(rows)
+        if rr <= 0:
+            return monthly * n
+        return monthly * (((1 + rr) ** n - 1) / rr)
+
+    lo, hi = -0.9, 1.0
+    for _ in range(100):
+        mid = (lo + hi) / 2
+        if sip_fv(mid) < final_value:
+            lo = mid
+        else:
+            hi = mid
+    xirr = round(hi * 100, 2)
+
+    return _clean({
+        "scheme_code": scheme_code,
+        "name": (payload.get("meta") or {}).get("scheme_name", "Unknown"),
+        "monthly": monthly,
+        "years": years,
+        "instalments": len(rows),
+        "invested": round(invested, 2),
+        "final_value": round(final_value, 2),
+        "gain": round(gain, 2),
+        "gain_pct": round(gain / invested * 100, 2) if invested else None,
+        "xirr_pct": xirr,
+        "latest_nav": round(latest_nav, 4),
+        "schedule": rows[::max(len(rows) // 60, 1)],
+    })
+
+
 @app.get("/funds/{scheme_code}")
 def fund_detail(scheme_code: str):
     """NAV history + returns for one scheme."""
