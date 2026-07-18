@@ -1056,6 +1056,124 @@ def fii_dii():
 
 
 # ===========================================================================
+# SECTOR PERFORMANCE
+# ===========================================================================
+#
+# NSE sector indices via Yahoo. Returns are computed from close prices rather
+# than quoted, so every window uses the same basis and stays consistent.
+SECTOR_INDICES = {
+    "Nifty 50": "^NSEI",
+    "Bank": "^NSEBANK",
+    "IT": "^CNXIT",
+    "Auto": "^CNXAUTO",
+    "Pharma": "^CNXPHARMA",
+    "FMCG": "^CNXFMCG",
+    "Metal": "^CNXMETAL",
+    "Realty": "^CNXREALTY",
+    "Energy": "^CNXENERGY",
+    "Infra": "^CNXINFRA",
+    "PSU Bank": "^CNXPSUBANK",
+    "Media": "^CNXMEDIA",
+    "Financial Services": "NIFTY_FIN_SERVICE.NS",
+    "Private Bank": "NIFTY_PVT_BANK.NS",
+    "Consumer Durables": "^CNXCONSUM",
+    "Commodities": "^CNXCMDT",
+}
+
+# Trading-day lookbacks. Approximate because markets close on weekends and
+# holidays — we take the nearest available close at or before each offset.
+_PERIOD_DAYS = {
+    "1d": 1,
+    "1m": 22,
+    "1y": 252,
+    "2y": 504,
+    "3y": 756,
+    "5y": 1260,
+}
+
+
+@app.get("/sectors")
+def sector_performance(compare: str = "1y"):
+    """
+    Sector index levels with 1-day, 1-month and one longer-window return.
+
+    [compare] is one of 1y, 2y, 3y, 5y. Sectors are ranked by 1-month return,
+    strongest first, so the leaders sit at the top.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    compare = compare.lower()
+    if compare not in {"1y", "2y", "3y", "5y"}:
+        raise HTTPException(
+            400, "compare must be one of: 1y, 2y, 3y, 5y")
+
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise HTTPException(503, "yfinance is not installed on the server")
+
+    def pull(item):
+        name, ticker = item
+        try:
+            # 6y of daily closes covers the longest window with room to spare.
+            hist = yf.Ticker(ticker).history(period="6y")["Close"].dropna()
+            if hist.empty or len(hist) < 2:
+                return None
+
+            closes = hist.tolist()
+            latest = float(closes[-1])
+
+            def ret(days: int):
+                """Return over the last `days` sessions, or None if too short."""
+                if len(closes) <= days:
+                    return None
+                past = float(closes[-(days + 1)])
+                if past <= 0:
+                    return None
+                return round((latest / past - 1) * 100, 2)
+
+            return {
+                "name": name,
+                "ticker": ticker,
+                "level": round(latest, 2),
+                "return_1d": ret(_PERIOD_DAYS["1d"]),
+                "return_1m": ret(_PERIOD_DAYS["1m"]),
+                "return_compare": ret(_PERIOD_DAYS[compare]),
+                "compare_period": compare.upper(),
+                "sessions": len(closes),
+            }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = [s for s in pool.map(pull, SECTOR_INDICES.items()) if s]
+
+    if not results:
+        raise HTTPException(
+            502, "Could not fetch any sector data right now")
+
+    # Rank by 1-month return; sectors missing it sink to the bottom.
+    results.sort(key=lambda s: (s["return_1m"] is None,
+                                -(s["return_1m"] or 0)))
+
+    gainers = [s for s in results if (s["return_1m"] or 0) > 0]
+    losers = [s for s in results if (s["return_1m"] or 0) < 0]
+
+    return _clean({
+        "count": len(results),
+        "compare_period": compare.upper(),
+        "available_periods": ["1Y", "2Y", "3Y", "5Y"],
+        "summary": {
+            "advancing": len(gainers),
+            "declining": len(losers),
+            "best": results[0]["name"] if results else None,
+            "worst": results[-1]["name"] if results else None,
+        },
+        "sectors": results,
+    })
+
+
+# ===========================================================================
 # PORTFOLIO DOCTOR  (your unique feature)
 # ===========================================================================
 class Holding(BaseModel):
