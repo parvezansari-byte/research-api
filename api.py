@@ -1782,6 +1782,356 @@ def option_chain(index: str = "NIFTY 50", expiry: str = "",
 
 
 # ===========================================================================
+# FUND DATABASE  (bundled snapshot + live NAV)
+# ===========================================================================
+#
+# Metrics come from a monthly research snapshot shipped alongside this file:
+# AUM, expense ratio, risk ratios, portfolio composition and manager — none of
+# which AMFI's public NAV feed carries. NAV itself is refreshed daily from
+# mfapi so prices don't go stale between snapshots.
+#
+# These are REGULAR plan figures. Direct plans of the same schemes carry a
+# lower expense ratio and correspondingly higher returns, so the numbers here
+# should not be compared against a Direct-plan quote.
+
+import json as _json
+import os as _os
+import re as _re
+import threading as _threading
+from datetime import datetime as _datetime, timedelta as _timedelta
+
+_FUNDS_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                            "funds_data.json")
+
+_funds_cache: list | None = None
+_nav_cache: dict[str, dict] = {}      # normalised key -> {nav, date, code}
+_nav_refreshed_at: _datetime | None = None
+_nav_lock = _threading.Lock()
+
+
+def _load_funds() -> list:
+    """The bundled snapshot, loaded once per process."""
+    global _funds_cache
+    if _funds_cache is None:
+        try:
+            with open(_FUNDS_FILE, "r", encoding="utf-8") as fh:
+                _funds_cache = _json.load(fh)
+        except Exception:
+            _funds_cache = []
+    return _funds_cache
+
+
+def _norm_scheme_name(name: str) -> str:
+    """
+    Reduce a scheme name to a comparable key.
+
+    The snapshot writes 'ICICI Pru Large Cap Fund(G)' where AMFI writes
+    'ICICI Prudential Large Cap Fund - Growth', so plan suffixes are stripped
+    and the snapshot's abbreviations expanded before comparing.
+    """
+    s = str(name)
+    # Punctuation first, so plan words are left as whole words to remove.
+    s = s.replace("&", " and ")
+    s = _re.sub(r"[^A-Za-z0-9 ]", " ", s)
+    s = _re.sub(r"\s+", " ", s).strip().lower()
+
+    # Whole words only — a partial strip would turn "regular" into "ular".
+    s = _re.sub(r"\b(regular|reg|direct|growth|gr|g|idcw|dividend|div|"
+                r"payout|reinvestment|reinvest|option|opt|plan|scheme)\b",
+                " ", s)
+    s = _re.sub(r"\s+", " ", s).strip()
+
+    for short, full in (
+        ("pru", "prudential"), ("sl", "sun life"), ("rob", "robeco"),
+        ("intl", "international"), ("opp", "opportunities"),
+        ("oppo", "opportunities"), ("mfg", "manufacturing"),
+        ("mgmt", "management"), ("bal", "balanced"),
+        ("sec", "securities"), ("corp", "corporate"),
+        ("govt", "government"), ("insti", "institutional"),
+        ("ltd", ""), ("fund", ""), ("funds", ""),
+    ):
+        s = _re.sub(rf"\b{short}\b", full, s)
+
+    # Spacing variants AMCs write inconsistently across sources.
+    s = _re.sub(r"\bblue\s+chip\b", "bluechip", s)
+    s = _re.sub(r"\bmid\s+cap\b", "midcap", s)
+    s = _re.sub(r"\bsmall\s+cap\b", "smallcap", s)
+    s = _re.sub(r"\blarge\s+cap\b", "largecap", s)
+    s = _re.sub(r"\bflexi\s+cap\b", "flexicap", s)
+    s = _re.sub(r"\bmulti\s+cap\b", "multicap", s)
+
+    return _re.sub(r"\s+", " ", s).strip()
+
+
+def _is_regular_growth(name: str) -> bool:
+    """
+    Keep Regular Growth plans only, to match the snapshot.
+
+    AMFI lists Direct and Regular variants of the same scheme with nearly
+    identical names; picking the wrong one would attach a Direct NAV to
+    Regular-plan metrics.
+    """
+    low = name.lower()
+    if "direct" in low:
+        return False
+    if any(w in low for w in ("idcw", "dividend", "payout", "reinvest",
+                              "bonus", "quarterly", "monthly", "daily",
+                              "weekly", "fortnightly")):
+        return False
+    return "growth" in low or "(g)" in low
+
+
+def _refresh_navs(force: bool = False) -> dict:
+    """
+    Rebuild the name -> latest NAV map from AMFI's daily feed.
+
+    AMFI publishes every scheme's NAV in one semicolon-delimited file, so this
+    is a single request rather than one per fund. Refreshed at most every six
+    hours; NAVs are only published once a day anyway.
+    """
+    global _nav_refreshed_at
+
+    with _nav_lock:
+        fresh = (_nav_refreshed_at is not None
+                 and _datetime.now() - _nav_refreshed_at < _timedelta(hours=6))
+        if fresh and not force and _nav_cache:
+            return {"status": "cached", "schemes": len(_nav_cache)}
+
+        import requests
+        try:
+            r = requests.get("https://www.amfiindia.com/spages/NAVAll.txt",
+                             timeout=30,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+        except Exception as e:
+            return {"status": "failed", "error": f"{type(e).__name__}: {e}",
+                    "schemes": len(_nav_cache)}
+
+        parsed = 0
+        for line in r.text.splitlines():
+            if line.count(";") < 5:
+                continue
+            parts = line.split(";")
+            code, name, nav, date = parts[0], parts[3], parts[4], parts[5]
+            if not code.strip().isdigit():
+                continue
+            if not _is_regular_growth(name):
+                continue
+            try:
+                value = float(nav)
+            except (TypeError, ValueError):
+                continue
+            if value <= 0:
+                continue
+            key = _norm_scheme_name(name)
+            # First match wins; AMFI lists the primary plan first.
+            if key not in _nav_cache or _nav_cache[key].get("stale"):
+                _nav_cache[key] = {"nav": round(value, 4),
+                                   "date": date.strip(),
+                                   "code": code.strip()}
+                parsed += 1
+
+        _nav_refreshed_at = _datetime.now()
+        return {"status": "refreshed", "schemes": len(_nav_cache),
+                "parsed": parsed}
+
+
+def _with_live_nav(fund: dict) -> dict:
+    """Overlay today's NAV where AMFI has a match for this scheme."""
+    out = dict(fund)
+    live = _nav_cache.get(fund.get("key", ""))
+    if live:
+        snapshot_nav = fund.get("nav")
+        out["nav"] = live["nav"]
+        out["nav_date"] = live["date"]
+        out["nav_live"] = True
+        out["scheme_code"] = live["code"]
+        # Movement since the snapshot is worth surfacing on its own.
+        if snapshot_nav:
+            out["nav_snapshot"] = snapshot_nav
+            try:
+                out["nav_change_pct"] = round(
+                    (live["nav"] / snapshot_nav - 1) * 100, 2)
+            except ZeroDivisionError:
+                pass
+    else:
+        out["nav_live"] = False
+    return out
+
+
+@app.get("/funds/db/categories")
+def fund_db_categories():
+    """Every category in the snapshot, grouped by asset class."""
+    funds = _load_funds()
+    if not funds:
+        raise HTTPException(503, "Fund database is not available on the server")
+
+    groups: dict[str, dict] = {}
+    for f in funds:
+        cls = f.get("classification")
+        if not cls:
+            continue
+        group = cls.split(" : ")[0].strip()
+        groups.setdefault(group, {})
+        groups[group][cls] = groups[group].get(cls, 0) + 1
+
+    out = []
+    for group in sorted(groups):
+        cats = [{"name": k, "count": v}
+                for k, v in sorted(groups[group].items(),
+                                   key=lambda kv: -kv[1])]
+        out.append({"group": group, "categories": cats,
+                    "total": sum(c["count"] for c in cats)})
+
+    return _clean({"groups": out, "total_funds": len(funds)})
+
+
+@app.get("/funds/db/list")
+def fund_db_list(category: str = "", sort: str = "aum",
+                 limit: int = 60, q: str = ""):
+    """
+    Funds in one category, ranked. NAVs are refreshed from AMFI where matched.
+
+    [sort] is one of aum, expense_ratio, r_1y, r_3y, r_5y, sharpe, alpha.
+    """
+    funds = _load_funds()
+    if not funds:
+        raise HTTPException(503, "Fund database is not available on the server")
+
+    _refresh_navs()
+
+    rows = funds
+    if category:
+        wanted = category.strip().lower()
+        rows = [f for f in rows
+                if str(f.get("classification", "")).lower() == wanted]
+        if not rows:
+            raise HTTPException(404, f"No funds in category '{category}'")
+
+    if q:
+        needle = q.strip().lower()
+        rows = [f for f in rows if needle in str(f.get("name", "")).lower()]
+
+    allowed = {"aum", "expense_ratio", "r_1m", "r_3m", "r_6m", "r_1y",
+               "r_2y", "r_3y", "r_5y", "r_10y", "sharpe", "alpha", "sortino"}
+    key = sort if sort in allowed else "aum"
+    # Lower expense ratio ranks better; everything else is higher-is-better.
+    ascending = key == "expense_ratio"
+    rows = sorted(
+        rows,
+        key=lambda f: (f.get(key) is None,
+                       (f.get(key) or 0) if ascending else -(f.get(key) or 0)),
+    )
+
+    live = [_with_live_nav(f) for f in rows[:limit]]
+    matched = sum(1 for f in live if f.get("nav_live"))
+
+    return _clean({
+        "category": category or "All",
+        "sort": key,
+        "count": len(live),
+        "total_in_category": len(rows),
+        "nav_matched": matched,
+        "nav_refreshed": _nav_refreshed_at.isoformat()
+        if _nav_refreshed_at else None,
+        "plan": "Regular",
+        "funds": live,
+    })
+
+
+@app.get("/funds/db/search")
+def fund_db_search(q: str, limit: int = 40):
+    """Search the snapshot by fund name."""
+    if len(q.strip()) < 2:
+        raise HTTPException(400, "Search needs at least 2 characters")
+
+    funds = _load_funds()
+    if not funds:
+        raise HTTPException(503, "Fund database is not available on the server")
+
+    _refresh_navs()
+    needle = q.strip().lower()
+
+    scored = []
+    for f in funds:
+        name = str(f.get("name", "")).lower()
+        if needle in name:
+            # Prefix matches are almost always what was meant.
+            scored.append((0 if name.startswith(needle) else 1,
+                           -(f.get("aum") or 0), f))
+    scored.sort(key=lambda t: (t[0], t[1]))
+
+    live = [_with_live_nav(f) for _, _, f in scored[:limit]]
+    return _clean({"query": q, "count": len(live), "funds": live})
+
+
+@app.get("/funds/db/fund")
+def fund_db_detail(name: str):
+    """Everything the snapshot holds on one fund, with a live NAV if matched."""
+    funds = _load_funds()
+    if not funds:
+        raise HTTPException(503, "Fund database is not available on the server")
+
+    _refresh_navs()
+    target = name.strip().lower()
+
+    match = next((f for f in funds
+                  if str(f.get("name", "")).lower() == target), None)
+    if match is None:
+        match = next((f for f in funds
+                      if target in str(f.get("name", "")).lower()), None)
+    if match is None:
+        raise HTTPException(404, f"No fund named '{name}'")
+
+    fund = _with_live_nav(match)
+
+    # Peers in the same category, for context on the metrics above.
+    peers = [f for f in funds
+             if f.get("classification") == match.get("classification")
+             and f.get("name") != match.get("name")]
+    peers.sort(key=lambda f: -(f.get("aum") or 0))
+
+    def rank_of(field: str, higher_better: bool = True):
+        same = [f for f in funds
+                if f.get("classification") == match.get("classification")
+                and f.get(field) is not None]
+        if match.get(field) is None or not same:
+            return None
+        same.sort(key=lambda f: -f[field] if higher_better else f[field])
+        for i, f in enumerate(same, 1):
+            if f.get("name") == match.get("name"):
+                return {"rank": i, "of": len(same)}
+        return None
+
+    return _clean({
+        "fund": fund,
+        "ranks": {
+            "r_1y": rank_of("r_1y"),
+            "r_3y": rank_of("r_3y"),
+            "r_5y": rank_of("r_5y"),
+            "sharpe": rank_of("sharpe"),
+            "expense_ratio": rank_of("expense_ratio", higher_better=False),
+            "aum": rank_of("aum"),
+        },
+        "peers": [_with_live_nav(p) for p in peers[:8]],
+    })
+
+
+@app.get("/funds/db/refresh-nav")
+def fund_db_refresh_nav():
+    """Force a NAV refresh and report how many schemes matched."""
+    result = _refresh_navs(force=True)
+    funds = _load_funds()
+    matched = sum(1 for f in funds if f.get("key") in _nav_cache)
+    return _clean({
+        **result,
+        "funds_in_db": len(funds),
+        "funds_matched": matched,
+        "match_rate": round(matched / len(funds) * 100, 1) if funds else 0,
+    })
+
+
+# ===========================================================================
 # PORTFOLIO DOCTOR  (your unique feature)
 # ===========================================================================
 class Holding(BaseModel):
