@@ -1548,6 +1548,239 @@ def chart_data(symbol: str, timeframe: str = "1D"):
     })
 
 
+@app.get("/chart")
+def chart_data_query(symbol: str, timeframe: str = "1D"):
+    """
+    Same as /chart/{symbol}, but the symbol arrives as a query parameter.
+
+    Index tickers start with '^', which some clients mangle when it sits in a
+    path segment. Passing it as a query value sidesteps that entirely.
+    """
+    return chart_data(symbol, timeframe)
+
+
+# ===========================================================================
+# OPTION CHAIN  (Dhan Data API)
+# ===========================================================================
+#
+# Talks to Dhan's REST endpoints directly rather than through the SDK, which
+# has had breaking changes between versions. Needs an active Data APIs
+# subscription on the Dhan account — a plain trading login returns 403.
+
+OPTION_INDICES = {
+    "NIFTY 50":     {"security_id": 13,  "segment": "IDX_I", "step": 50},
+    "BANK NIFTY":   {"security_id": 25,  "segment": "IDX_I", "step": 100},
+    "FIN NIFTY":    {"security_id": 27,  "segment": "IDX_I", "step": 50},
+    "MIDCAP NIFTY": {"security_id": 442, "segment": "IDX_I", "step": 25},
+}
+
+
+def _dhan_option_headers():
+    """Auth headers for Dhan's Data API, or None when unconfigured."""
+    import os
+    token = (os.environ.get("DHAN_ACCESS_TOKEN")
+             or os.environ.get("DHANHQ_ACCESS_TOKEN"))
+    client = (os.environ.get("DHAN_CLIENT_ID")
+              or os.environ.get("DHANHQ_CLIENT_ID"))
+    if not token:
+        return None
+    headers = {
+        "access-token": token,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if client:
+        headers["client-id"] = client
+    return headers
+
+
+def _dhan_error(status: int, body: str) -> str:
+    """Turn Dhan's HTTP codes into something a user can act on."""
+    if status == 401:
+        return ("Dhan token is invalid or expired. Generate a fresh one at "
+                "web.dhan.co and update DHAN_ACCESS_TOKEN.")
+    if status == 403:
+        return ("Dhan denied access to the Data API. Check that the Data APIs "
+                "subscription is active on this account.")
+    if status == 429:
+        return "Dhan rate limit hit. Wait a few seconds and try again."
+    return f"Dhan returned HTTP {status}: {body[:200]}"
+
+
+@app.get("/options/indices")
+def option_indices():
+    """Indices that can be charted, with their strike steps."""
+    return {"indices": [{"name": k, **v} for k, v in OPTION_INDICES.items()]}
+
+
+@app.get("/options/expiries")
+def option_expiries(index: str = "NIFTY 50"):
+    """Available expiry dates for one index, nearest first."""
+    import requests
+
+    cfg = OPTION_INDICES.get(index.upper()) or OPTION_INDICES.get(index)
+    if cfg is None:
+        raise HTTPException(
+            404, f"Unknown index '{index}'. "
+                 f"Options: {', '.join(OPTION_INDICES)}")
+
+    headers = _dhan_option_headers()
+    if headers is None:
+        raise HTTPException(
+            503, "DHAN_ACCESS_TOKEN is not set on the server")
+
+    try:
+        r = requests.post(
+            "https://api.dhan.co/v2/optionchain/expirylist",
+            headers=headers,
+            json={"UnderlyingScrip": cfg["security_id"],
+                  "UnderlyingSeg": cfg["segment"]},
+            timeout=12)
+    except Exception as e:
+        raise HTTPException(502, f"Network error reaching Dhan: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(502, _dhan_error(r.status_code, r.text))
+
+    expiries = r.json().get("data") or []
+    if not expiries:
+        raise HTTPException(404, f"Dhan returned no expiries for {index}")
+
+    return _clean({"index": index, "count": len(expiries),
+                   "expiries": expiries})
+
+
+@app.get("/options/chain")
+def option_chain(index: str = "NIFTY 50", expiry: str = "",
+                 strikes: int = 10):
+    """
+    Full option chain for one index and expiry, plus the derived metrics.
+
+    [strikes] limits the returned rows to that many either side of ATM, which
+    is what actually matters — the far wings carry almost no open interest.
+    """
+    import requests
+
+    cfg = OPTION_INDICES.get(index.upper()) or OPTION_INDICES.get(index)
+    if cfg is None:
+        raise HTTPException(
+            404, f"Unknown index '{index}'. "
+                 f"Options: {', '.join(OPTION_INDICES)}")
+
+    headers = _dhan_option_headers()
+    if headers is None:
+        raise HTTPException(
+            503, "DHAN_ACCESS_TOKEN is not set on the server")
+
+    # Default to the nearest expiry when none is given.
+    if not expiry:
+        try:
+            found = option_expiries(index)
+            expiry = (found.get("expiries") or [""])[0]
+        except HTTPException:
+            raise
+        if not expiry:
+            raise HTTPException(404, "Could not determine an expiry")
+
+    try:
+        r = requests.post(
+            "https://api.dhan.co/v2/optionchain",
+            headers=headers,
+            json={"UnderlyingScrip": cfg["security_id"],
+                  "UnderlyingSeg": cfg["segment"],
+                  "Expiry": expiry},
+            timeout=15)
+    except Exception as e:
+        raise HTTPException(502, f"Network error reaching Dhan: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(502, _dhan_error(r.status_code, r.text))
+
+    data = r.json().get("data") or {}
+    oc = data.get("oc") or {}
+    spot = float(data.get("last_price") or 0)
+
+    rows = []
+    for strike_str, legs in oc.items():
+        try:
+            strike = float(strike_str)
+        except (TypeError, ValueError):
+            continue
+        ce = legs.get("ce") or {}
+        pe = legs.get("pe") or {}
+        rows.append({
+            "strike": strike,
+            "ce_oi": float(ce.get("oi") or 0),
+            "ce_ltp": float(ce.get("last_price") or 0),
+            "ce_iv": float(ce.get("implied_volatility") or 0),
+            "pe_oi": float(pe.get("oi") or 0),
+            "pe_ltp": float(pe.get("last_price") or 0),
+            "pe_iv": float(pe.get("implied_volatility") or 0),
+        })
+
+    if not rows:
+        raise HTTPException(
+            404, f"Dhan returned an empty chain for {index} {expiry}")
+
+    rows.sort(key=lambda x: x["strike"])
+
+    # --- metrics over the whole chain ---
+    total_ce_oi = sum(r_["ce_oi"] for r_ in rows)
+    total_pe_oi = sum(r_["pe_oi"] for r_ in rows)
+    pcr = (total_pe_oi / total_ce_oi) if total_ce_oi > 0 else 0.0
+
+    # Max pain: the strike where option writers pay out least in total.
+    max_pain, best_pain = None, None
+    for candidate in (r_["strike"] for r_ in rows):
+        pain = 0.0
+        for r_ in rows:
+            pain += r_["ce_oi"] * max(0.0, candidate - r_["strike"])
+            pain += r_["pe_oi"] * max(0.0, r_["strike"] - candidate)
+        if best_pain is None or pain < best_pain:
+            best_pain, max_pain = pain, candidate
+
+    atm = min((r_["strike"] for r_ in rows),
+              key=lambda s: abs(s - spot)) if spot else None
+
+    if pcr > 1.3:
+        signal = "Strongly bullish — heavy put writing"
+    elif pcr > 1.0:
+        signal = "Bullish"
+    elif pcr > 0.7:
+        signal = "Neutral to mildly bearish"
+    else:
+        signal = "Bearish — heavy call writing"
+
+    # --- window around ATM ---
+    window = rows
+    if atm is not None and strikes > 0:
+        span = strikes * cfg["step"]
+        window = [r_ for r_ in rows
+                  if atm - span <= r_["strike"] <= atm + span]
+        if not window:
+            window = rows
+
+    highest_pe = max(window, key=lambda r_: r_["pe_oi"], default=None)
+    highest_ce = max(window, key=lambda r_: r_["ce_oi"], default=None)
+
+    return _clean({
+        "index": index,
+        "expiry": expiry,
+        "spot": round(spot, 2),
+        "atm": atm,
+        "step": cfg["step"],
+        "pcr": round(pcr, 2),
+        "signal": signal,
+        "total_ce_oi": total_ce_oi,
+        "total_pe_oi": total_pe_oi,
+        "max_pain": max_pain,
+        "support": highest_pe["strike"] if highest_pe else None,
+        "resistance": highest_ce["strike"] if highest_ce else None,
+        "count": len(window),
+        "rows": window,
+    })
+
+
 # ===========================================================================
 # PORTFOLIO DOCTOR  (your unique feature)
 # ===========================================================================
