@@ -2384,6 +2384,376 @@ def holdings_overlap(a: str, b: str):
 
 
 # ===========================================================================
+# STRATEGY BACKTEST
+# ===========================================================================
+#
+# Event-driven simulation on real historical prices. The signal is decided on
+# day t's close and executed at day t+1's open, so no trade ever uses a price
+# it couldn't have known — the commonest way a backtest flatters itself.
+#
+# Stop-loss and take-profit are checked against the day's low and high while
+# in position. One position at a time, fully invested, no leverage. Brokerage
+# and slippage are not modelled, so real results would be slightly worse.
+
+BACKTEST_STRATEGIES = {
+    "SMA Crossover": {
+        "description": "Hold while the fast moving average is above the slow one.",
+        "params": [
+            {"key": "fast", "label": "Fast SMA (days)", "min": 5, "max": 50,
+             "default": 20},
+            {"key": "slow", "label": "Slow SMA (days)", "min": 20, "max": 200,
+             "default": 50},
+        ],
+    },
+    "RSI Mean Reversion": {
+        "description": "Buy when oversold, exit once it recovers.",
+        "params": [
+            {"key": "rsi_window", "label": "RSI window", "min": 7, "max": 21,
+             "default": 14},
+            {"key": "rsi_buy", "label": "Buy below RSI", "min": 15, "max": 40,
+             "default": 30},
+            {"key": "rsi_sell", "label": "Exit above RSI", "min": 50, "max": 80,
+             "default": 60},
+        ],
+    },
+    "Momentum (200-day trend)": {
+        "description": "Hold only while price is above its 200-day average.",
+        "params": [],
+    },
+    "Buy & Hold": {
+        "description": "Buy on day one and never sell — the benchmark.",
+        "params": [],
+    },
+}
+
+BACKTEST_PERIODS = {"1 Year": "1y", "2 Years": "2y",
+                    "5 Years": "5y", "10 Years": "10y"}
+
+
+def _bt_rsi(closes: list, window: int) -> list:
+    """Wilder-style RSI on a simple moving average of gains and losses."""
+    out = [None] * len(closes)
+    if len(closes) <= window:
+        return out
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    for i in range(window, len(gains) + 1):
+        avg_gain = sum(gains[i - window:i]) / window
+        avg_loss = sum(losses[i - window:i]) / window
+        if avg_loss == 0:
+            out[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            out[i] = 100 - 100 / (1 + rs)
+    return out
+
+
+def _bt_sma(values: list, window: int) -> list:
+    out = [None] * len(values)
+    if window <= 0 or len(values) < window:
+        return out
+    running = sum(values[:window])
+    out[window - 1] = running / window
+    for i in range(window, len(values)):
+        running += values[i] - values[i - window]
+        out[i] = running / window
+    return out
+
+
+def _bt_signals(closes: list, strategy: str, params: dict) -> list:
+    """Desired position per day: 1 = long, 0 = flat."""
+    n = len(closes)
+
+    if strategy == "Buy & Hold":
+        return [1] * n
+
+    if strategy == "SMA Crossover":
+        fast = _bt_sma(closes, int(params.get("fast", 20)))
+        slow = _bt_sma(closes, int(params.get("slow", 50)))
+        return [1 if (fast[i] is not None and slow[i] is not None
+                      and fast[i] > slow[i]) else 0 for i in range(n)]
+
+    if strategy == "Momentum (200-day trend)":
+        sma = _bt_sma(closes, 200)
+        return [1 if (sma[i] is not None and closes[i] > sma[i]) else 0
+                for i in range(n)]
+
+    if strategy == "RSI Mean Reversion":
+        window = int(params.get("rsi_window", 14))
+        buy = float(params.get("rsi_buy", 30))
+        sell = float(params.get("rsi_sell", 60))
+        r = _bt_rsi(closes, window)
+        # Position persists between thresholds, so carry the last state.
+        out, state = [], 0
+        for value in r:
+            if value is not None:
+                if value < buy:
+                    state = 1
+                elif value > sell:
+                    state = 0
+            out.append(state)
+        return out
+
+    return [0] * n
+
+
+def _bt_simulate(candles: list, desired: list, capital: float,
+                 stop_loss: float, take_profit: float, use_sl_tp: bool):
+    """
+    Walk the price series day by day.
+
+    Returns (equity curve, trades). Signals are lagged one day so a decision
+    made on today's close is acted on at tomorrow's open.
+    """
+    cash, shares = capital, 0.0
+    entry_price = None
+    equity, trades = [], []
+
+    lagged = [0] + desired[:-1]
+
+    for i, c in enumerate(candles):
+        want = lagged[i]
+
+        # Entry and signal exits happen at the open.
+        if shares == 0 and want == 1 and c["open"] > 0:
+            entry_price = c["open"]
+            shares = cash / entry_price
+            cash = 0.0
+            trades.append({"entry_date": c["date"], "entry": entry_price,
+                           "exit_date": None, "exit": None, "reason": None})
+        elif shares > 0 and want == 0:
+            cash = shares * c["open"]
+            trades[-1].update({"exit_date": c["date"], "exit": c["open"],
+                               "reason": "Signal"})
+            shares, entry_price = 0.0, None
+
+        # Stop-loss and take-profit are intraday, so use the day's range.
+        if shares > 0 and use_sl_tp and entry_price:
+            sl_price = entry_price * (1 - stop_loss / 100)
+            tp_price = entry_price * (1 + take_profit / 100)
+            if c["low"] <= sl_price:
+                cash = shares * sl_price
+                trades[-1].update({"exit_date": c["date"], "exit": sl_price,
+                                   "reason": "Stop Loss"})
+                shares, entry_price = 0.0, None
+            elif c["high"] >= tp_price:
+                cash = shares * tp_price
+                trades[-1].update({"exit_date": c["date"], "exit": tp_price,
+                                   "reason": "Take Profit"})
+                shares, entry_price = 0.0, None
+
+        equity.append(cash + shares * c["close"])
+
+    # An open position is marked to the last close, not sold.
+    if trades and trades[-1]["exit"] is None:
+        trades[-1].update({"exit_date": candles[-1]["date"],
+                           "exit": candles[-1]["close"],
+                           "reason": "Open (marked)"})
+
+    return equity, trades
+
+
+def _bt_metrics(equity: list, capital: float, days: int) -> dict:
+    if not equity or capital <= 0:
+        return {}
+
+    final = equity[-1]
+    total = (final / capital - 1) * 100
+    years = days / 365.25
+
+    cagr = None
+    if years > 0.25 and final > 0:
+        cagr = ((final / capital) ** (1 / years) - 1) * 100
+
+    # Daily returns for Sharpe, annualised at 252 trading days.
+    rets = []
+    for i in range(1, len(equity)):
+        if equity[i - 1] > 0:
+            rets.append(equity[i] / equity[i - 1] - 1)
+    sharpe = 0.0
+    if len(rets) > 1:
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        sd = var ** 0.5
+        if sd > 0:
+            sharpe = mean / sd * (252 ** 0.5)
+
+    peak, max_dd = equity[0], 0.0
+    for v in equity:
+        peak = max(peak, v)
+        if peak > 0:
+            max_dd = min(max_dd, v / peak - 1)
+
+    return {
+        "final": round(final, 2),
+        "total": round(total, 2),
+        "cagr": round(cagr, 2) if cagr is not None else None,
+        "sharpe": round(sharpe, 2),
+        "max_drawdown": round(max_dd * 100, 2),
+    }
+
+
+@app.get("/backtest/strategies")
+def backtest_strategies():
+    """Strategies, their tunable parameters, and the periods on offer."""
+    return {
+        "strategies": [
+            {"name": k, "description": v["description"], "params": v["params"]}
+            for k, v in BACKTEST_STRATEGIES.items()
+        ],
+        "periods": list(BACKTEST_PERIODS.keys()),
+    }
+
+
+@app.get("/backtest/run")
+def backtest_run(symbol: str, strategy: str = "SMA Crossover",
+                 period: str = "5 Years", capital: float = 100000,
+                 fast: int = 20, slow: int = 50,
+                 rsi_window: int = 14, rsi_buy: float = 30,
+                 rsi_sell: float = 60,
+                 stop_loss: float = 10, take_profit: float = 20,
+                 use_sl_tp: bool = False):
+    """
+    Backtest one strategy on one symbol, against Buy & Hold on the same data.
+    """
+    if strategy not in BACKTEST_STRATEGIES:
+        raise HTTPException(
+            400, f"Unknown strategy. Options: {', '.join(BACKTEST_STRATEGIES)}")
+    if period not in BACKTEST_PERIODS:
+        raise HTTPException(
+            400, f"Unknown period. Options: {', '.join(BACKTEST_PERIODS)}")
+    if strategy == "SMA Crossover" and fast >= slow:
+        raise HTTPException(
+            400, "Fast SMA must be shorter than slow SMA")
+    if capital <= 0:
+        raise HTTPException(400, "Capital must be positive")
+
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise HTTPException(503, "yfinance is not installed on the server")
+
+    sym = symbol.strip().upper()
+    if not sym.startswith("^") and not sym.endswith((".NS", ".BO")):
+        sym = f"{sym}.NS"
+
+    try:
+        df = yf.Ticker(sym).history(period=BACKTEST_PERIODS[period])
+    except Exception as e:
+        raise HTTPException(502, f"Price download failed: {e}")
+
+    if df.empty or len(df) < 60:
+        raise HTTPException(
+            404, f"Not enough price history for '{symbol}'. NSE symbols need "
+                 "no suffix (RELIANCE).")
+
+    if strategy == "Momentum (200-day trend)" and len(df) < 220:
+        raise HTTPException(
+            400, "The 200-day trend strategy needs about a year of data. "
+                 "Choose a longer period.")
+
+    candles = []
+    for stamp, row in df.iterrows():
+        try:
+            o, h, l, c = (float(row["Open"]), float(row["High"]),
+                          float(row["Low"]), float(row["Close"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if any(v != v for v in (o, h, l, c)):   # NaN check
+            continue
+        candles.append({"date": stamp.strftime("%Y-%m-%d"),
+                        "open": o, "high": h, "low": l, "close": c})
+
+    if len(candles) < 60:
+        raise HTTPException(404, f"Not enough usable prices for '{symbol}'")
+
+    closes = [c["close"] for c in candles]
+    params = {"fast": fast, "slow": slow, "rsi_window": rsi_window,
+              "rsi_buy": rsi_buy, "rsi_sell": rsi_sell}
+
+    signals = _bt_signals(closes, strategy, params)
+    equity, trades = _bt_simulate(candles, signals, capital,
+                                  stop_loss, take_profit, use_sl_tp)
+
+    # Benchmark on identical data, so the comparison is like for like.
+    bh_equity, _ = _bt_simulate(candles, [1] * len(candles), capital,
+                                0, 0, False)
+
+    from datetime import datetime as _dt
+    span = (_dt.strptime(candles[-1]["date"], "%Y-%m-%d")
+            - _dt.strptime(candles[0]["date"], "%Y-%m-%d")).days or 1
+
+    metrics = _bt_metrics(equity, capital, span)
+    benchmark = _bt_metrics(bh_equity, capital, span)
+
+    # Trade statistics from closed positions only.
+    closed = [t for t in trades if t["exit"] is not None]
+    returns = [(t["exit"] / t["entry"] - 1) * 100
+               for t in closed if t["entry"]]
+    wins = [r for r in returns if r > 0]
+    losses = [r for r in returns if r <= 0]
+    loss_sum = abs(sum(losses))
+
+    trade_rows = []
+    for t in closed[-40:]:
+        pct = (t["exit"] / t["entry"] - 1) * 100 if t["entry"] else None
+        trade_rows.append({
+            "entry_date": t["entry_date"],
+            "entry": round(t["entry"], 2),
+            "exit_date": t["exit_date"],
+            "exit": round(t["exit"], 2),
+            "reason": t["reason"],
+            "return_pct": round(pct, 2) if pct is not None else None,
+        })
+
+    # Downsample the curves; a 10-year daily series is far more than a phone
+    # chart can show.
+    step = max(len(equity) // 180, 1)
+    curve = [{"date": candles[i]["date"],
+              "strategy": round(equity[i], 2),
+              "buy_hold": round(bh_equity[i], 2)}
+             for i in range(0, len(equity), step)]
+    if curve and curve[-1]["date"] != candles[-1]["date"]:
+        curve.append({"date": candles[-1]["date"],
+                      "strategy": round(equity[-1], 2),
+                      "buy_hold": round(bh_equity[-1], 2)})
+
+    edge = metrics["total"] - benchmark["total"]
+
+    return _clean({
+        "symbol": sym.replace(".NS", "").replace(".BO", ""),
+        "strategy": strategy,
+        "period": period,
+        "capital": capital,
+        "from": candles[0]["date"],
+        "to": candles[-1]["date"],
+        "sessions": len(candles),
+        "metrics": metrics,
+        "benchmark": benchmark,
+        "edge_pp": round(edge, 2),
+        "beat_benchmark": edge > 0,
+        "trades": {
+            "total": len(closed),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(len(wins) / len(returns) * 100, 1)
+            if returns else None,
+            "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+            "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            "best": round(max(returns), 2) if returns else None,
+            "worst": round(min(returns), 2) if returns else None,
+            "profit_factor": round(sum(wins) / loss_sum, 2)
+            if loss_sum > 0 else None,
+            "recent": trade_rows,
+        },
+        "curve": curve,
+    })
+
+
+# ===========================================================================
 # PORTFOLIO DOCTOR  (your unique feature)
 # ===========================================================================
 class Holding(BaseModel):
