@@ -3189,6 +3189,140 @@ class HoldingIn(BaseModel):
     avg_price: float
 
 
+# ===========================================================================
+# PORTFOLIO  (saved holdings valued at live prices)
+# ===========================================================================
+#
+# Holdings themselves are stored by the /holdings endpoints. This values them:
+# one live price per symbol, then per-position and whole-portfolio P&L.
+#
+# Prices come from the same Dhan-first path as everything else, so a portfolio
+# view costs the shared Yahoo quota nothing when Dhan can answer.
+
+def _live_price(symbol: str):
+    """
+    Latest price for one symbol, or None.
+
+    Tries Dhan's quote path first, then falls back to the last close from
+    whichever history source answers — a slightly old close beats no value.
+    """
+    sym = symbol.strip().upper().replace(".NS", "")
+
+    try:
+        quote = live_quote(sym)
+        price = quote.get("price")
+        if price:
+            return float(price), quote.get("source", "dhan")
+    except Exception:
+        pass
+
+    try:
+        df = _price_history(sym, "1mo", "1d")
+        if df is not None and not df.empty:
+            return float(df["Close"].iloc[-1]), "close"
+    except Exception:
+        pass
+
+    return None, None
+
+
+@app.get("/portfolio/{email}")
+def portfolio_valuation(email: str):
+    """
+    Saved holdings with live prices, per-position P&L and portfolio totals.
+
+    A symbol whose price can't be fetched is still returned, marked priced=false
+    and excluded from the totals — silently dropping it would understate the
+    portfolio, and silently valuing it at cost would overstate the gain.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured")
+
+    email = email.strip().lower()
+    try:
+        res = (sb.table("holdings")
+                 .select("symbol,qty,avg_price")
+                 .eq("user_email", email)
+                 .order("symbol").execute())
+        rows = res.data or []
+    except Exception as e:
+        raise HTTPException(502, f"Could not load holdings: {e}")
+
+    if not rows:
+        return _clean({
+            "email": email, "count": 0, "holdings": [],
+            "totals": {"invested": 0, "current": 0, "pnl": 0,
+                       "pnl_pct": None, "priced": 0, "unpriced": 0},
+        })
+
+    def value(row):
+        symbol = str(row.get("symbol", "")).upper()
+        qty = float(row.get("qty") or 0)
+        avg = float(row.get("avg_price") or 0)
+        invested = qty * avg
+
+        price, source = _live_price(symbol)
+        if price is None:
+            return {
+                "symbol": symbol, "qty": qty, "avg_price": round(avg, 2),
+                "invested": round(invested, 2), "priced": False,
+                "price": None, "current": None, "pnl": None,
+                "pnl_pct": None, "source": None,
+            }
+
+        current = qty * price
+        pnl = current - invested
+        return {
+            "symbol": symbol, "qty": qty, "avg_price": round(avg, 2),
+            "invested": round(invested, 2), "priced": True,
+            "price": round(price, 2), "current": round(current, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl / invested * 100, 2) if invested > 0 else None,
+            "source": source,
+        }
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        holdings = list(pool.map(value, rows))
+
+    priced = [h for h in holdings if h["priced"]]
+    invested = sum(h["invested"] for h in priced)
+    current = sum(h["current"] for h in priced)
+    pnl = current - invested
+
+    # Weight each position by current value, so the pie reflects what the
+    # portfolio is now rather than what it cost.
+    for h in priced:
+        h["weight_pct"] = (round(h["current"] / current * 100, 2)
+                           if current > 0 else None)
+
+    gainers = sorted([h for h in priced if (h["pnl"] or 0) > 0],
+                     key=lambda h: -(h["pnl_pct"] or 0))
+    losers = sorted([h for h in priced if (h["pnl"] or 0) < 0],
+                    key=lambda h: (h["pnl_pct"] or 0))
+
+    # Present biggest positions first — that's the order people scan in.
+    holdings.sort(key=lambda h: -(h["current"] or 0))
+
+    return _clean({
+        "email": email,
+        "count": len(holdings),
+        "holdings": holdings,
+        "totals": {
+            "invested": round(invested, 2),
+            "current": round(current, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl / invested * 100, 2) if invested > 0 else None,
+            "priced": len(priced),
+            "unpriced": len(holdings) - len(priced),
+        },
+        "best": gainers[0] if gainers else None,
+        "worst": losers[0] if losers else None,
+    })
+
+
 @app.get("/holdings/{email}")
 def get_holdings(email: str):
     """This user's saved holdings."""
