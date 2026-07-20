@@ -2132,6 +2132,258 @@ def fund_db_refresh_nav():
 
 
 # ===========================================================================
+# HOLDINGS EXPLORER
+# ===========================================================================
+#
+# Real portfolio disclosures from AMC monthly factsheets: which stocks each
+# fund actually owns, at what weight. This is the one thing AMFI's public
+# feed never carries, so it ships as a bundled snapshot.
+#
+# Coverage is partial — only the AMCs that publish machine-readable monthly
+# disclosures are included, and every response says which those are so the
+# absence of a fund is never mistaken for the absence of a holding.
+
+_HOLDINGS_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                               "holdings_data.json")
+
+_holdings_cache: dict | None = None
+
+
+def _load_holdings() -> dict:
+    """The bundled disclosure snapshot, loaded once per process."""
+    global _holdings_cache
+    if _holdings_cache is None:
+        try:
+            with open(_HOLDINGS_FILE, "r", encoding="utf-8") as fh:
+                _holdings_cache = _json.load(fh)
+        except Exception:
+            _holdings_cache = {"as_on": None, "securities": {}, "funds": {}}
+    return _holdings_cache
+
+
+def _fund_rows(key: str) -> list:
+    """Holdings of one fund as dicts, weight-sorted."""
+    data = _load_holdings()
+    secs = data.get("securities", {})
+    out = []
+    for isin, pct, value, qty in data.get("funds", {}).get(key, []):
+        meta = secs.get(isin, [isin, "Other"])
+        out.append({
+            "isin": isin,
+            "instrument": meta[0],
+            "industry": meta[1],
+            "pct_nav": pct,
+            "value_lakh": value,
+            "quantity": qty,
+        })
+    return out
+
+
+@app.get("/holdings/summary")
+def holdings_summary():
+    """Coverage of the disclosure snapshot."""
+    data = _load_holdings()
+    funds = data.get("funds", {})
+    if not funds:
+        raise HTTPException(
+            503, "Holdings data is not available on the server")
+
+    amcs = sorted({k.split("|", 1)[0] for k in funds})
+    total_rows = sum(len(v) for v in funds.values())
+
+    return _clean({
+        "as_on": data.get("as_on"),
+        "funds": len(funds),
+        "amcs": len(amcs),
+        "amc_names": amcs,
+        "holdings": total_rows,
+        "securities": len(data.get("securities", {})),
+    })
+
+
+@app.get("/holdings/funds")
+def holdings_funds(amc: str = ""):
+    """Every fund in the snapshot, optionally filtered to one AMC."""
+    data = _load_holdings()
+    funds = data.get("funds", {})
+    if not funds:
+        raise HTTPException(
+            503, "Holdings data is not available on the server")
+
+    out = []
+    for key in sorted(funds):
+        fund_amc, fund_name = key.split("|", 1)
+        if amc and fund_amc.lower() != amc.strip().lower():
+            continue
+        out.append({
+            "key": key,
+            "amc": fund_amc,
+            "fund": fund_name,
+            "holdings": len(funds[key]),
+        })
+
+    return _clean({"count": len(out), "funds": out})
+
+
+@app.get("/holdings/stock")
+def holdings_stock(q: str):
+    """
+    Which funds hold a given stock, ranked by weight.
+
+    Matching is on the instrument name, so a partial query like "hdfc bank"
+    returns every security whose name contains it — the caller picks which.
+    """
+    if len(q.strip()) < 3:
+        raise HTTPException(400, "Search needs at least 3 characters")
+
+    data = _load_holdings()
+    secs = data.get("securities", {})
+    if not secs:
+        raise HTTPException(
+            503, "Holdings data is not available on the server")
+
+    needle = q.strip().lower()
+    matching = {isin: meta for isin, meta in secs.items()
+                if needle in meta[0].lower()}
+    if not matching:
+        raise HTTPException(404, f"No security matching '{q}'")
+
+    # Group by security, since one query can hit several listings.
+    by_isin: dict[str, list] = {isin: [] for isin in matching}
+    for key, rows in data.get("funds", {}).items():
+        amc, fund = key.split("|", 1)
+        for isin, pct, value, qty in rows:
+            if isin in by_isin:
+                by_isin[isin].append({
+                    "amc": amc, "fund": fund,
+                    "pct_nav": pct, "value_lakh": value, "quantity": qty,
+                })
+
+    results = []
+    for isin, holders in by_isin.items():
+        if not holders:
+            continue
+        holders.sort(key=lambda h: -(h["pct_nav"] or 0))
+        total_value = sum(h["value_lakh"] or 0 for h in holders)
+        results.append({
+            "isin": isin,
+            "instrument": matching[isin][0],
+            "industry": matching[isin][1],
+            "fund_count": len(holders),
+            "total_value_cr": round(total_value / 100, 2),
+            "max_weight": holders[0]["pct_nav"],
+            "holders": holders[:40],
+        })
+
+    results.sort(key=lambda r: -r["fund_count"])
+    return _clean({
+        "query": q,
+        "as_on": data.get("as_on"),
+        "matches": len(results),
+        "securities": results[:12],
+    })
+
+
+@app.get("/holdings/fund")
+def holdings_fund(key: str):
+    """One fund's portfolio, with sector allocation and concentration."""
+    data = _load_holdings()
+    if key not in data.get("funds", {}):
+        raise HTTPException(404, f"No holdings for '{key}'")
+
+    rows = _fund_rows(key)
+    amc, fund = key.split("|", 1)
+
+    sectors: dict[str, float] = {}
+    for r in rows:
+        sectors[r["industry"]] = sectors.get(r["industry"], 0) + (r["pct_nav"] or 0)
+    sector_list = [{"industry": k, "pct_nav": round(v, 2)}
+                   for k, v in sorted(sectors.items(), key=lambda kv: -kv[1])]
+
+    disclosed = sum(r["pct_nav"] or 0 for r in rows)
+    top10 = sum(r["pct_nav"] or 0 for r in rows[:10])
+
+    return _clean({
+        "as_on": data.get("as_on"),
+        "amc": amc,
+        "fund": fund,
+        "count": len(rows),
+        "disclosed_pct": round(disclosed, 2),
+        "top10_pct": round(top10, 2),
+        "sectors": sector_list,
+        "holdings": rows,
+    })
+
+
+@app.get("/holdings/overlap")
+def holdings_overlap(a: str, b: str):
+    """
+    Portfolio overlap between two funds.
+
+    Overlap is the sum of the smaller weight of each shared holding — the
+    standard measure. Two funds each holding 5% of the same stock overlap by
+    5% there; if one holds 5% and the other 2%, they overlap by 2%.
+    """
+    data = _load_holdings()
+    funds = data.get("funds", {})
+    for key in (a, b):
+        if key not in funds:
+            raise HTTPException(404, f"No holdings for '{key}'")
+    if a == b:
+        raise HTTPException(400, "Pick two different funds")
+
+    rows_a = {r["isin"]: r for r in _fund_rows(a)}
+    rows_b = {r["isin"]: r for r in _fund_rows(b)}
+
+    common = []
+    overlap_pct = 0.0
+    for isin, ra in rows_a.items():
+        rb = rows_b.get(isin)
+        if rb is None:
+            continue
+        wa = ra["pct_nav"] or 0
+        wb = rb["pct_nav"] or 0
+        shared = min(wa, wb)
+        overlap_pct += shared
+        common.append({
+            "instrument": ra["instrument"],
+            "industry": ra["industry"],
+            "pct_a": wa,
+            "pct_b": wb,
+            "shared": round(shared, 3),
+        })
+
+    common.sort(key=lambda c: -c["shared"])
+
+    if overlap_pct > 60:
+        verdict = "Very high — these are close to the same portfolio"
+        band = "very_high"
+    elif overlap_pct > 40:
+        verdict = "High — holding both adds little diversification"
+        band = "high"
+    elif overlap_pct > 20:
+        verdict = "Moderate — some shared exposure"
+        band = "moderate"
+    else:
+        verdict = "Low — genuinely different portfolios"
+        band = "low"
+
+    amc_a, fund_a = a.split("|", 1)
+    amc_b, fund_b = b.split("|", 1)
+
+    return _clean({
+        "as_on": data.get("as_on"),
+        "fund_a": {"amc": amc_a, "fund": fund_a, "holdings": len(rows_a)},
+        "fund_b": {"amc": amc_b, "fund": fund_b, "holdings": len(rows_b)},
+        "common_count": len(common),
+        "overlap_pct": round(overlap_pct, 2),
+        "verdict": verdict,
+        "band": band,
+        "common": common[:60],
+    })
+
+
+# ===========================================================================
 # PORTFOLIO DOCTOR  (your unique feature)
 # ===========================================================================
 class Holding(BaseModel):
