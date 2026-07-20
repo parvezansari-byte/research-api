@@ -458,6 +458,28 @@ def stock_detail(symbol: str):
         fundamentals = get_fundamentals(sym)
         _, signals = get_technicals(sym)
     except Exception as e:
+        # Yahoo limits per IP, and every user of this server shares one, so
+        # throttling is routine rather than exceptional. Say so plainly.
+        if _yf_rate_limited(e):
+            # Fundamentals need Yahoo, but the price doesn't — Dhan can still
+            # answer. A partial response beats an error screen.
+            try:
+                quote = live_quote(symbol)
+                return _clean({
+                    "symbol": sym,
+                    "partial": True,
+                    "notice": "Yahoo is rate-limiting this server, so "
+                              "fundamentals and technicals are unavailable "
+                              "right now. The price below is live from Dhan.",
+                    "fundamentals": {"current_price": quote.get("price")},
+                    "technicals": {},
+                })
+            except Exception:
+                pass
+            raise HTTPException(
+                503,
+                "Yahoo is rate-limiting this server right now. Try again in "
+                "a minute.")
         raise HTTPException(502, f"Data source error: {e}")
 
     if not signals:
@@ -1318,7 +1340,7 @@ def sector_performance(compare: str = "1y"):
         name, ticker = item
         try:
             # 6y of daily closes covers the longest window with room to spare.
-            hist = yf.Ticker(ticker).history(period="6y")["Close"].dropna()
+            hist = _yf_history(ticker, "6y")["Close"].dropna()
             if hist.empty or len(hist) < 2:
                 return None
 
@@ -1451,19 +1473,22 @@ def chart_data(symbol: str, timeframe: str = "1D"):
 
     try:
         ticker = yf.Ticker(sym)
-        df = ticker.history(period=cfg["period"], interval=cfg["interval"])
+        used_interval = cfg["interval"]
+        df = _yf_history(sym, cfg["period"], used_interval)
 
         # 1-minute NSE data is patchy; 5-minute is a reliable stand-in.
-        used_interval = cfg["interval"]
         if df.empty and cfg["interval"] == "1m":
-            df = ticker.history(period=cfg["period"], interval="5m")
             used_interval = "5m"
+            df = _yf_history(sym, cfg["period"], used_interval)
 
         # A fresh session before the open returns nothing — show the last day.
         if df.empty and tf == "1D":
-            df = ticker.history(period="5d", interval="15m")
             used_interval = "15m"
+            df = _yf_history(sym, "5d", used_interval)
     except Exception as e:
+        if _yf_rate_limited(e):
+            raise HTTPException(
+                503, "Yahoo is rate-limiting this server. Try again shortly.")
         raise HTTPException(502, f"Chart data error: {e}")
 
     if df.empty or "Close" not in df.columns:
@@ -1779,6 +1804,100 @@ def option_chain(index: str = "NIFTY 50", expiry: str = "",
         "count": len(window),
         "rows": window,
     })
+
+
+# ===========================================================================
+# YAHOO RATE-LIMIT HANDLING
+# ===========================================================================
+#
+# Every request from this server shares one IP, so Yahoo's per-IP limit is
+# reached far sooner than it would be for a single user. Two defences:
+#
+#   1. Cache responses, so repeat views cost nothing upstream.
+#   2. Retry with backoff, then serve stale cache rather than failing — a
+#      price a few minutes old beats an error page.
+
+import threading as _yf_threading
+
+_YF_LOCK = _yf_threading.Lock()
+_yf_cache: dict[str, tuple[float, object]] = {}   # key -> (stored_at, value)
+
+# History moves slowly; quotes need to be fresher.
+_YF_TTL = {
+    "history": 900,      # 15 min
+    "quote": 120,        # 2 min
+    "info": 3600,        # 1 hr — fundamentals barely change intraday
+}
+
+
+def _yf_cached(key: str, kind: str, producer, allow_stale: bool = True):
+    """
+    Run [producer] at most once per TTL for [key].
+
+    On failure, a stale cached value is returned when one exists — being a
+    little out of date is almost always better than showing nothing.
+    """
+    import time
+
+    ttl = _YF_TTL.get(kind, 300)
+    now = time.time()
+
+    with _YF_LOCK:
+        hit = _yf_cache.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+
+    try:
+        value = producer()
+        with _YF_LOCK:
+            _yf_cache[key] = (now, value)
+            # Keep the cache from growing without bound on a long-lived process.
+            if len(_yf_cache) > 500:
+                oldest = sorted(_yf_cache.items(), key=lambda kv: kv[1][0])
+                for k, _ in oldest[:100]:
+                    _yf_cache.pop(k, None)
+        return value
+    except Exception:
+        if allow_stale and hit:
+            return hit[1]
+        raise
+
+
+def _yf_history(symbol: str, period: str = "1y", interval: str = "1d"):
+    """
+    Price history with caching and backoff.
+
+    Yahoo answers a rate-limited request with an exception rather than a
+    status code, so any failure is retried briefly before giving up.
+    """
+    import time
+
+    def fetch():
+        import yfinance as yf
+        last_error = None
+        for attempt in range(3):
+            try:
+                df = yf.Ticker(symbol).history(period=period,
+                                               interval=interval)
+                if not df.empty:
+                    return df
+                last_error = ValueError("empty response")
+            except Exception as e:
+                last_error = e
+            # 0.5s, then 1.5s — enough to clear a short burst limit without
+            # holding the request open for long.
+            if attempt < 2:
+                time.sleep(0.5 + attempt)
+        raise last_error or ValueError("no data")
+
+    return _yf_cached(f"hist:{symbol}:{period}:{interval}", "history", fetch)
+
+
+def _yf_rate_limited(error: Exception) -> bool:
+    """Whether an exception looks like Yahoo throttling rather than a bad symbol."""
+    text = str(error).lower()
+    return any(s in text for s in
+               ("too many requests", "rate limit", "429", "try after"))
 
 
 # ===========================================================================
@@ -2641,8 +2760,11 @@ def backtest_run(symbol: str, strategy: str = "SMA Crossover",
         sym = f"{sym}.NS"
 
     try:
-        df = yf.Ticker(sym).history(period=BACKTEST_PERIODS[period])
+        df = _yf_history(sym, BACKTEST_PERIODS[period])
     except Exception as e:
+        if _yf_rate_limited(e):
+            raise HTTPException(
+                503, "Yahoo is rate-limiting this server. Try again shortly.")
         raise HTTPException(502, f"Price download failed: {e}")
 
     if df.empty or len(df) < 60:
