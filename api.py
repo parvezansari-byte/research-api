@@ -1474,7 +1474,7 @@ def chart_data(symbol: str, timeframe: str = "1D"):
     try:
         ticker = yf.Ticker(sym)
         used_interval = cfg["interval"]
-        df = _yf_history(sym, cfg["period"], used_interval)
+        df = _price_history(sym, cfg["period"], used_interval)
 
         # 1-minute NSE data is patchy; 5-minute is a reliable stand-in.
         if df.empty and cfg["interval"] == "1m":
@@ -1898,6 +1898,102 @@ def _yf_rate_limited(error: Exception) -> bool:
     text = str(error).lower()
     return any(s in text for s in
                ("too many requests", "rate limit", "429", "try after"))
+
+
+# ===========================================================================
+# PRICE SOURCE  (Dhan first, Yahoo as fallback)
+# ===========================================================================
+#
+# Yahoo limits by IP and every user of this server shares one, so it is the
+# wrong primary source for anything called often. Dhan is a paid API keyed to
+# this account, has no such shared-IP ceiling, and already powers live quotes
+# here — so price history now goes to Dhan first.
+#
+# Yahoo remains the fallback, and stays the only source for fundamentals:
+# Dhan serves prices, not P/E or ROE.
+
+def _dhan_history(symbol: str, days: int = 400):
+    """
+    Daily OHLC from Dhan as a DataFrame indexed by date.
+
+    Returns None rather than raising when Dhan can't serve this symbol, so
+    callers can fall through to Yahoo without special-casing every failure.
+    """
+    from datetime import datetime, timedelta
+
+    sym = symbol.strip().upper().replace(".NS", "").replace(".BO", "")
+    if sym.startswith("^"):
+        return None          # indices aren't equities in the scrip master
+
+    try:
+        from dhanhq_api import get_dhan_client
+        client = get_dhan_client()
+        if client is None:
+            return None
+
+        sec_id = client.get_security_id(sym)
+        if not sec_id:
+            return None
+
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=days)
+        df = client.get_historical_daily(
+            sec_id,
+            from_date.strftime("%Y-%m-%d"),
+            to_date.strftime("%Y-%m-%d"),
+        )
+        if df is None or df.empty:
+            return None
+
+        # Normalise column names to match what the Yahoo path returns, so
+        # downstream code doesn't need to know which source answered.
+        rename = {}
+        for col in df.columns:
+            low = str(col).lower()
+            if low in ("open", "high", "low", "close", "volume"):
+                rename[col] = low.capitalize()
+        df = df.rename(columns=rename)
+
+        needed = {"Open", "High", "Low", "Close"}
+        if not needed.issubset(df.columns):
+            return None
+
+        return df
+    except Exception:
+        return None
+
+
+def _price_history(symbol: str, period: str = "1y", interval: str = "1d",
+                   prefer_dhan: bool = True):
+    """
+    Daily price history from whichever source can serve it.
+
+    Dhan is tried first for daily equity data. Intraday intervals and indices
+    fall straight through to Yahoo, which handles both.
+    """
+    period_days = {
+        "1d": 5, "5d": 10, "1mo": 45, "3mo": 120, "6mo": 220,
+        "1y": 400, "2y": 760, "5y": 1850, "10y": 3700, "6y": 2200,
+        "max": 3700,
+    }
+
+    is_daily = interval in ("1d", "1wk", "1mo")
+    is_index = symbol.strip().startswith("^")
+
+    if prefer_dhan and is_daily and not is_index:
+        df = _dhan_history(symbol, period_days.get(period, 400))
+        if df is not None and len(df) > 5:
+            # Weekly and monthly bars are resampled locally; Dhan returns
+            # daily candles only.
+            if interval == "1wk":
+                df = df.resample("W").agg({"Open": "first", "High": "max",
+                                           "Low": "min", "Close": "last"}).dropna()
+            elif interval == "1mo":
+                df = df.resample("ME").agg({"Open": "first", "High": "max",
+                                            "Low": "min", "Close": "last"}).dropna()
+            return df
+
+    return _yf_history(symbol, period, interval)
 
 
 # ===========================================================================
@@ -2760,7 +2856,7 @@ def backtest_run(symbol: str, strategy: str = "SMA Crossover",
         sym = f"{sym}.NS"
 
     try:
-        df = _yf_history(sym, BACKTEST_PERIODS[period])
+        df = _price_history(sym, BACKTEST_PERIODS[period])
     except Exception as e:
         if _yf_rate_limited(e):
             raise HTTPException(
@@ -2873,6 +2969,55 @@ def backtest_run(symbol: str, strategy: str = "SMA Crossover",
         },
         "curve": curve,
     })
+
+
+@app.get("/debug/price-source")
+def debug_price_source(symbol: str = "RELIANCE"):
+    """
+    Which source can currently serve prices for a symbol.
+
+    Useful when data looks stale or missing: it separates "Dhan token expired"
+    from "Yahoo is throttling" without reading server logs.
+    """
+    out = {"symbol": symbol}
+
+    # --- Dhan ---
+    try:
+        df = _dhan_history(symbol, 30)
+        if df is not None and not df.empty:
+            out["dhan"] = {
+                "ok": True,
+                "rows": len(df),
+                "last_close": round(float(df["Close"].iloc[-1]), 2),
+                "last_date": str(df.index[-1])[:10],
+            }
+        else:
+            out["dhan"] = {"ok": False,
+                           "reason": "no data returned (symbol or token?)"}
+    except Exception as e:
+        out["dhan"] = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+
+    # --- Yahoo ---
+    try:
+        sym = symbol if symbol.startswith("^") else f"{symbol}.NS"
+        df = _yf_history(sym, "1mo")
+        if df is not None and not df.empty:
+            out["yahoo"] = {
+                "ok": True,
+                "rows": len(df),
+                "last_close": round(float(df["Close"].iloc[-1]), 2),
+            }
+        else:
+            out["yahoo"] = {"ok": False, "reason": "empty response"}
+    except Exception as e:
+        out["yahoo"] = {
+            "ok": False,
+            "rate_limited": _yf_rate_limited(e),
+            "reason": f"{type(e).__name__}: {str(e)[:140]}",
+        }
+
+    out["cache_entries"] = len(_yf_cache)
+    return _clean(out)
 
 
 # ===========================================================================
