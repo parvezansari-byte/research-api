@@ -3147,6 +3147,378 @@ def login(req: AuthRequest):
     return {"email": email, "name": rec.get("name") or email.split("@")[0]}
 
 
+# ===========================================================================
+# EMAIL VERIFICATION & PASSWORD RESET
+# ===========================================================================
+#
+# Signup sends a six-digit code to the address given; the account is only
+# created once that code comes back. Password reset works the same way.
+#
+# Codes live in Supabase rather than memory, so they survive the free tier
+# spinning down between requests. They are stored hashed — a leaked database
+# shouldn't hand over working codes.
+#
+# Sending uses plain SMTP. With Gmail that means an App Password (not the
+# account password), set as SMTP_USER / SMTP_PASSWORD.
+
+_OTP_TTL_MINUTES = 10
+_OTP_MAX_ATTEMPTS = 5
+_OTP_RESEND_SECONDS = 60
+
+
+def _otp_hash(code: str) -> str:
+    """Codes are stored hashed; only the six digits the user types can match."""
+    import hashlib
+    return hashlib.sha256(f"otp:{code}".encode()).hexdigest()
+
+
+def _send_email(to: str, subject: str, body: str) -> None:
+    """
+    Send one plain-text email over SMTP.
+
+    Raises rather than returning a status: if the code can't be delivered
+    there's no point pretending signup is in progress.
+    """
+    import os
+    import smtplib
+    from email.message import EmailMessage
+
+    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.environ.get("SMTP_PORT", "587"))
+    user = os.environ.get("SMTP_USER")
+    password = os.environ.get("SMTP_PASSWORD")
+    sender = os.environ.get("SMTP_FROM") or user
+
+    if not user or not password:
+        raise HTTPException(
+            503,
+            "Email is not configured on the server. Set SMTP_USER and "
+            "SMTP_PASSWORD (a Gmail App Password) in the environment.")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = to
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(host, port, timeout=20) as server:
+            server.starttls()
+            server.login(user, password)
+            server.send_message(msg)
+    except Exception as e:
+        raise HTTPException(502, f"Could not send the email: {e}")
+
+
+def _store_otp(email: str, purpose: str, code: str) -> None:
+    """Replace any previous code for this address and purpose."""
+    from datetime import datetime, timezone, timedelta
+
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+
+    expires = datetime.now(timezone.utc) + timedelta(minutes=_OTP_TTL_MINUTES)
+    try:
+        sb.table("otp_codes").delete().eq("email", email) \
+          .eq("purpose", purpose).execute()
+        sb.table("otp_codes").insert({
+            "email": email,
+            "purpose": purpose,
+            "code_hash": _otp_hash(code),
+            "expires_at": expires.isoformat(),
+            "attempts": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        raise HTTPException(
+            502,
+            f"Could not store the verification code: {e}. The otp_codes "
+            "table may not exist yet.")
+
+
+def _verify_otp(email: str, purpose: str, code: str) -> None:
+    """
+    Check a submitted code, or raise with the reason.
+
+    Wrong attempts are counted so a six-digit code can't be brute-forced, and
+    a correct code is deleted immediately so it can't be replayed.
+    """
+    from datetime import datetime, timezone
+
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+
+    try:
+        res = (sb.table("otp_codes").select("*")
+                 .eq("email", email).eq("purpose", purpose)
+                 .limit(1).execute())
+        rows = res.data or []
+    except Exception as e:
+        raise HTTPException(502, f"Could not check the code: {e}")
+
+    if not rows:
+        raise HTTPException(
+            400, "No code was requested for this email, or it has expired.")
+
+    row = rows[0]
+
+    try:
+        expires = datetime.fromisoformat(
+            str(row["expires_at"]).replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+    except Exception:
+        expires = datetime.now(timezone.utc)
+
+    if datetime.now(timezone.utc) > expires:
+        try:
+            sb.table("otp_codes").delete().eq("email", email) \
+              .eq("purpose", purpose).execute()
+        except Exception:
+            pass
+        raise HTTPException(400, "That code has expired. Request a new one.")
+
+    attempts = int(row.get("attempts") or 0)
+    if attempts >= _OTP_MAX_ATTEMPTS:
+        try:
+            sb.table("otp_codes").delete().eq("email", email) \
+              .eq("purpose", purpose).execute()
+        except Exception:
+            pass
+        raise HTTPException(
+            429, "Too many incorrect attempts. Request a new code.")
+
+    if row.get("code_hash") != _otp_hash(code.strip()):
+        try:
+            sb.table("otp_codes").update({"attempts": attempts + 1}) \
+              .eq("email", email).eq("purpose", purpose).execute()
+        except Exception:
+            pass
+        remaining = _OTP_MAX_ATTEMPTS - attempts - 1
+        raise HTTPException(
+            400,
+            f"That code isn't right. {remaining} attempt"
+            f"{'s' if remaining != 1 else ''} left.")
+
+    # Correct — consume it.
+    try:
+        sb.table("otp_codes").delete().eq("email", email) \
+          .eq("purpose", purpose).execute()
+    except Exception:
+        pass
+
+
+def _recent_otp_seconds(email: str, purpose: str):
+    """Seconds since the last code was sent, or None if there wasn't one."""
+    from datetime import datetime, timezone
+
+    sb = _supabase()
+    if sb is None:
+        return None
+    try:
+        res = (sb.table("otp_codes").select("created_at")
+                 .eq("email", email).eq("purpose", purpose)
+                 .limit(1).execute())
+        rows = res.data or []
+        if not rows:
+            return None
+        created = datetime.fromisoformat(
+            str(rows[0]["created_at"]).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created).total_seconds()
+    except Exception:
+        return None
+
+
+class OtpRequest(BaseModel):
+    email: str
+
+
+class SignupVerify(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+    code: str
+
+
+class ResetVerify(BaseModel):
+    email: str
+    code: str
+    new_password: str
+
+
+@app.post("/auth/signup/request-otp")
+def signup_request_otp(req: OtpRequest):
+    """Email a verification code for a new account."""
+    import secrets
+
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+
+    email = req.email.strip().lower()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(400, "Enter a valid email address")
+
+    try:
+        existing = sb.table("users").select("email").eq("email", email).execute()
+        if existing.data:
+            raise HTTPException(
+                409, "An account with this email already exists. Sign in "
+                     "instead, or reset your password.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Could not check the email: {e}")
+
+    since = _recent_otp_seconds(email, "signup")
+    if since is not None and since < _OTP_RESEND_SECONDS:
+        raise HTTPException(
+            429,
+            f"A code was just sent. Wait {int(_OTP_RESEND_SECONDS - since)}s "
+            "before asking for another.")
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    _store_otp(email, "signup", code)
+    _send_email(
+        email,
+        "Your verification code",
+        f"Your verification code is {code}\n\n"
+        f"It expires in {_OTP_TTL_MINUTES} minutes.\n\n"
+        "If you didn't request this, you can ignore this email.",
+    )
+
+    return {"sent": True, "email": email, "expires_in": _OTP_TTL_MINUTES * 60}
+
+
+@app.post("/auth/signup/verify")
+def signup_verify(req: SignupVerify):
+    """Create the account once the emailed code checks out."""
+    import bcrypt
+
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+
+    email = req.email.strip().lower()
+    if len(req.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+
+    _verify_otp(email, "signup", req.code)
+
+    try:
+        # Re-check: someone else may have registered while this code was live.
+        existing = sb.table("users").select("email").eq("email", email).execute()
+        if existing.data:
+            raise HTTPException(
+                409, "An account with this email already exists")
+
+        pw_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+        name = req.name.strip() or email.split("@")[0].title()
+        sb.table("users").insert({
+            "email": email,
+            "password_hash": pw_hash,
+            "name": name,
+            "email_verified": True,
+        }).execute()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Could not create the account: {e}")
+
+    return {"email": email, "name": name}
+
+
+@app.post("/auth/reset/request-otp")
+def reset_request_otp(req: OtpRequest):
+    """
+    Email a password-reset code.
+
+    Always reports success, even when no account exists — otherwise this
+    endpoint would confirm which addresses are registered.
+    """
+    import secrets
+
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+
+    email = req.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(400, "Enter a valid email address")
+
+    try:
+        found = sb.table("users").select("email").eq("email", email).execute()
+        exists = bool(found.data)
+    except Exception:
+        exists = False
+
+    if exists:
+        since = _recent_otp_seconds(email, "reset")
+        if since is not None and since < _OTP_RESEND_SECONDS:
+            raise HTTPException(
+                429,
+                f"A code was just sent. Wait "
+                f"{int(_OTP_RESEND_SECONDS - since)}s before asking again.")
+
+        code = f"{secrets.randbelow(1000000):06d}"
+        _store_otp(email, "reset", code)
+        _send_email(
+            email,
+            "Your password reset code",
+            f"Your password reset code is {code}\n\n"
+            f"It expires in {_OTP_TTL_MINUTES} minutes.\n\n"
+            "If you didn't request this, your account is still safe — you can "
+            "ignore this email.",
+        )
+
+    return {"sent": True, "expires_in": _OTP_TTL_MINUTES * 60}
+
+
+@app.post("/auth/reset/verify")
+def reset_verify(req: ResetVerify):
+    """Set a new password once the reset code checks out."""
+    import bcrypt
+
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+
+    email = req.email.strip().lower()
+    if len(req.new_password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+
+    _verify_otp(email, "reset", req.code)
+
+    try:
+        pw_hash = bcrypt.hashpw(
+            req.new_password.encode(), bcrypt.gensalt()).decode()
+        sb.table("users").update({"password_hash": pw_hash}) \
+          .eq("email", email).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Could not update the password: {e}")
+
+    return {"reset": True, "email": email}
+
+
+@app.get("/debug/email")
+def debug_email():
+    """Whether SMTP is configured, without revealing the credentials."""
+    import os
+    user = os.environ.get("SMTP_USER")
+    return {
+        "smtp_host": os.environ.get("SMTP_HOST", "smtp.gmail.com"),
+        "smtp_port": os.environ.get("SMTP_PORT", "587"),
+        "smtp_user_set": bool(user),
+        "smtp_password_set": bool(os.environ.get("SMTP_PASSWORD")),
+        "from": os.environ.get("SMTP_FROM") or (user or "not set"),
+        "ready": bool(user and os.environ.get("SMTP_PASSWORD")),
+    }
+
+
 @app.post("/auth/signup")
 def signup(req: AuthRequest):
     """Create an account. Password is hashed with bcrypt, never stored raw."""
