@@ -203,6 +203,524 @@ def stock_list_detailed():
     return {"count": len(rows), "stocks": rows, "sectors": sectors}
 
 
+
+# =============================================================================
+# MARKET DATA — sectors, live chart, FII/DII flows, market news
+# =============================================================================
+# Same situation as Holdings Explorer: this code existed on the previously-
+# running Render instance but was never in the GitHub source, so it was lost
+# the moment a fresh deploy replaced that stale instance. Rebuilt here,
+# reusing proven logic from the Crescent web app (dashboard.py's sector
+# section, live_chart.py, and advanced_news.py's multi-source FII/DII and
+# RSS news fetchers) so behavior matches across both platforms.
+# =============================================================================
+
+import html as _mhtml
+import re as _mre
+from datetime import datetime as _mdatetime, timezone as _mtimezone
+from time import time as _mtime
+
+import pandas as _mpd
+import yfinance as _myf
+
+# ---------------------------------------------------------------------------
+# Tiny in-memory TTL cache - api.py runs outside Streamlit, so there's no
+# st.cache_data here. This is the same idea cache_compat.py already applies
+# elsewhere in this codebase, just written directly since these functions
+# don't call into any Streamlit-cached code.
+# ---------------------------------------------------------------------------
+_M_CACHE: dict = {}
+
+
+def _m_cached(key: str, ttl_seconds: int, fn):
+    now = _mtime()
+    hit = _M_CACHE.get(key)
+    if hit and now - hit[0] < ttl_seconds:
+        return hit[1]
+    value = fn()
+    _M_CACHE[key] = (now, value)
+    return value
+
+
+# =============================================================================
+# SECTORS
+# =============================================================================
+_M_SECTOR_DIRECT = {"Bank": "^NSEBANK", "IT": "^CNXIT", "Pharma": "^CNXPHARMA"}
+_M_SECTOR_BASKETS = {
+    "Auto": ["MARUTI.NS", "TATAMOTORS.NS", "M&M.NS", "BAJAJ-AUTO.NS", "EICHERMOT.NS", "HEROMOTOCO.NS"],
+    "FMCG": ["HINDUNILVR.NS", "ITC.NS", "NESTLEIND.NS", "BRITANNIA.NS", "DABUR.NS", "GODREJCP.NS"],
+    "Metal": ["TATASTEEL.NS", "JSWSTEEL.NS", "HINDALCO.NS", "VEDL.NS", "SAIL.NS", "JINDALSTEL.NS"],
+    "Energy": ["RELIANCE.NS", "ONGC.NS", "NTPC.NS", "POWERGRID.NS", "BPCL.NS", "IOC.NS"],
+    "Realty": ["DLF.NS", "GODREJPROP.NS", "OBEROIRLTY.NS", "PRESTIGE.NS", "PHOENIXLTD.NS", "BRIGADE.NS"],
+    "PSU Bank": ["SBIN.NS", "BANKBARODA.NS", "PNB.NS", "CANBK.NS", "UNIONBANK.NS", "INDIANB.NS"],
+    "Infra": ["LT.NS", "ADANIPORTS.NS", "GMRINFRA.NS", "IRB.NS", "NBCC.NS", "NCC.NS"],
+}
+_M_COMPARE_DAYS = {"1y": 365, "2y": 730, "3y": 1095, "5y": 1825}
+
+
+def _m_compute_sectors(compare: str):
+    period_days = _M_COMPARE_DAYS.get(compare, 365)
+    yf_period = f"{max(period_days // 365, 1) + 1}y"
+
+    all_direct = list(_M_SECTOR_DIRECT.values())
+    all_basket = [s for basket in _M_SECTOR_BASKETS.values() for s in basket]
+    all_symbols = all_direct + all_basket
+
+    data = _myf.download(all_symbols, period=yf_period, progress=False,
+                         auto_adjust=True, group_by="ticker", threads=True)
+
+    def _closes(symbol):
+        try:
+            s = data[symbol]["Close"].dropna()
+            return s if len(s) >= 2 else None
+        except Exception:
+            return None
+
+    def _returns(symbol):
+        c = _closes(symbol)
+        if c is None:
+            return None, None, None, None
+        last = float(c.iloc[-1])
+        r1d = (last / float(c.iloc[-2]) - 1) * 100 if len(c) >= 2 else None
+        r1m = None
+        if len(c) > 22:
+            r1m = (last / float(c.iloc[-22]) - 1) * 100
+        r_cmp = (last / float(c.iloc[0]) - 1) * 100
+        return last, r1d, r1m, r_cmp
+
+    sectors = []
+    for name, symbol in _M_SECTOR_DIRECT.items():
+        last, r1d, r1m, r_cmp = _returns(symbol)
+        if last is not None:
+            sectors.append({"name": name, "level": round(last, 1),
+                           "return_1d": r1d and round(r1d, 2),
+                           "return_1m": r1m and round(r1m, 2),
+                           "return_compare": r_cmp and round(r_cmp, 2)})
+
+    for name, basket in _M_SECTOR_BASKETS.items():
+        results = [_returns(s) for s in basket]
+        results = [r for r in results if r[0] is not None]
+        if not results:
+            continue
+        avg_level = sum(r[0] for r in results) / len(results)
+        avg_1d = [r[1] for r in results if r[1] is not None]
+        avg_1m = [r[2] for r in results if r[2] is not None]
+        avg_cmp = [r[3] for r in results if r[3] is not None]
+        sectors.append({
+            "name": name, "level": round(avg_level, 1),
+            "return_1d": round(sum(avg_1d) / len(avg_1d), 2) if avg_1d else None,
+            "return_1m": round(sum(avg_1m) / len(avg_1m), 2) if avg_1m else None,
+            "return_compare": round(sum(avg_cmp) / len(avg_cmp), 2) if avg_cmp else None,
+        })
+
+    sectors.sort(key=lambda s: (s["return_1m"] is None, -(s["return_1m"] or 0)))
+
+    advancing = sum(1 for s in sectors if (s["return_1m"] or 0) > 0)
+    declining = sum(1 for s in sectors if (s["return_1m"] or 0) < 0)
+    with_1m = [s for s in sectors if s["return_1m"] is not None]
+    best = with_1m[0]["name"] if with_1m else None
+    worst = with_1m[-1]["name"] if with_1m else None
+
+    return {
+        "sectors": sectors,
+        "summary": {"advancing": advancing, "declining": declining, "best": best, "worst": worst},
+        "compare_period": compare.upper(),
+    }
+
+
+@app.get("/sectors")
+def sectors(compare: str = "1y"):
+    try:
+        return _m_cached(f"sectors:{compare}", 3600, lambda: _m_compute_sectors(compare))
+    except Exception as e:
+        raise HTTPException(503, f"Could not load sector performance: {e}")
+
+
+# =============================================================================
+# LIVE CHART
+# =============================================================================
+_M_TIMEFRAME_CONFIG = {
+    "1D": {"period": "1d", "interval": "5m", "live": True},
+    "1W": {"period": "5d", "interval": "30m", "live": False},
+    "1M": {"period": "1mo", "interval": "1d", "live": False},
+    "6M": {"period": "6mo", "interval": "1d", "live": False},
+    "1Y": {"period": "1y", "interval": "1d", "live": False},
+    "5Y": {"period": "5y", "interval": "1wk", "live": False},
+    "ALL": {"period": "max", "interval": "1mo", "live": False},
+}
+_M_DISPLAY_NAMES = {
+    "^NSEI": "NIFTY 50", "^NSEBANK": "BANK NIFTY", "^BSESN": "SENSEX",
+}
+
+
+def _m_compute_chart(symbol: str, timeframe: str):
+    cfg = _M_TIMEFRAME_CONFIG.get(timeframe.upper(), _M_TIMEFRAME_CONFIG["1D"])
+    ticker = _myf.Ticker(symbol)
+    df = ticker.history(period=cfg["period"], interval=cfg["interval"])
+    if df.empty:
+        raise ValueError(f"No chart data for {symbol}")
+
+    prev_close = None
+    if cfg["live"]:
+        try:
+            prev_close = float(ticker.fast_info["previous_close"])
+        except Exception:
+            try:
+                daily = ticker.history(period="5d")["Close"]
+                if len(daily) >= 2:
+                    prev_close = float(daily.iloc[-2])
+            except Exception:
+                prev_close = None
+
+    closes = df["Close"].dropna()
+    last = float(closes.iloc[-1])
+    baseline = prev_close if (cfg["live"] and prev_close) else float(closes.iloc[0])
+    baseline_label = "prev close" if cfg["live"] else f"start of {timeframe.upper()}"
+
+    change = last - baseline
+    change_pct = (change / baseline * 100) if baseline else 0
+    high = float(df["High"].max())
+    low = float(df["Low"].min())
+    range_pct = ((high - low) / low * 100) if low else None
+
+    fmt = "%H:%M" if cfg["interval"].endswith("m") else "%d-%b"
+    series = [{"label": ts.strftime(fmt), "close": float(c)} for ts, c in closes.items()]
+
+    return {
+        "display": _M_DISPLAY_NAMES.get(symbol, symbol.replace(".NS", "")),
+        "last": round(last, 2), "change": round(change, 2), "change_pct": round(change_pct, 2),
+        "high": round(high, 2), "low": round(low, 2),
+        "range_pct": round(range_pct, 2) if range_pct is not None else None,
+        "updated": _mdatetime.now().strftime("%d-%b-%Y %H:%M"),
+        "live": cfg["live"], "interval": cfg["interval"], "points": len(series),
+        "baseline": round(baseline, 2), "baseline_label": baseline_label,
+        "series": series,
+    }
+
+
+@app.get("/chart/{symbol}")
+def chart(symbol: str, timeframe: str = "1D"):
+    try:
+        return _m_compute_chart(symbol, timeframe)
+    except Exception as e:
+        raise HTTPException(503, f"No chart data for {symbol}: {e}")
+
+
+# =============================================================================
+# FII / DII FLOWS
+# =============================================================================
+def _m_num(x):
+    try:
+        return float(str(x).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _m_fetch_fii_dii():
+    import requests
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA, "Accept": "application/json, text/plain, */*",
+                          "Referer": "https://www.nseindia.com/reports/fii-dii"})
+        s.get("https://www.nseindia.com", timeout=8)
+        r = s.get("https://www.nseindia.com/api/fiidiiTradeReact", timeout=8)
+        r.raise_for_status()
+        rows = []
+        for d in r.json():
+            cat = str(d.get("category", "")).upper()
+            rows.append({"who": "FII" if ("FII" in cat or "FPI" in cat) else "DII",
+                        "date": d.get("date", ""), "buy": _m_num(d.get("buyValue")),
+                        "sell": _m_num(d.get("sellValue")), "net": _m_num(d.get("netValue"))})
+        if rows:
+            return rows, "NSE"
+    except Exception:
+        pass
+
+    for url in ("https://api.stockedge.com/Api/FIIDailyDashboardApi/GetLatestFIIDIIActivities?lang=en",
+               "https://api.stockedge.com/Api/DailyDashboardApi/GetLatestFIIDIIActivity?lang=en"):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            rows = []
+            for d in items:
+                if not isinstance(d, dict):
+                    continue
+                blob = {str(k).lower(): v for k, v in d.items()}
+                who_raw = str(blob.get("name") or blob.get("category") or blob.get("clienttype") or "").upper()
+                who = "FII" if ("FII" in who_raw or "FPI" in who_raw) else ("DII" if "DII" in who_raw else None)
+                if not who:
+                    continue
+                buy = _m_num(blob.get("buyvalue") or blob.get("grosspurchase") or blob.get("buy"))
+                sell = _m_num(blob.get("sellvalue") or blob.get("grosssales") or blob.get("sell"))
+                net = _m_num(blob.get("netvalue") or blob.get("net"))
+                if net is None and buy is not None and sell is not None:
+                    net = buy - sell
+                rows.append({"who": who, "date": str(blob.get("date") or blob.get("tradedate") or ""),
+                           "buy": buy, "sell": sell, "net": net})
+            if rows:
+                seen = {}
+                for r2 in rows:
+                    seen.setdefault(r2["who"], r2)
+                return list(seen.values()), "StockEdge"
+        except Exception:
+            continue
+
+    for url in ("https://groww.in/v1/api/stocks_fo_data/v1/fii_dii/activity?count=2",
+               "https://groww.in/v1/api/stocks_fo_data/v1/fii_dii_activity"):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA, "Accept": "application/json"}, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            items = data.get("data") or data.get("fiiDiiList") or (data if isinstance(data, list) else [])
+            rows = []
+            for d in (items if isinstance(items, list) else []):
+                blob = {str(k).lower(): v for k, v in d.items()}
+                date = str(blob.get("date") or "")
+                for who, prefix in (("FII", "fii"), ("DII", "dii")):
+                    buy = _m_num(blob.get(f"{prefix}buy") or blob.get(f"{prefix}_buy"))
+                    sell = _m_num(blob.get(f"{prefix}sell") or blob.get(f"{prefix}_sell"))
+                    net = _m_num(blob.get(f"{prefix}net") or blob.get(f"{prefix}_net"))
+                    if net is None and buy is not None and sell is not None:
+                        net = buy - sell
+                    if net is not None:
+                        rows.append({"who": who, "date": date, "buy": buy, "sell": sell, "net": net})
+            if rows:
+                return rows[:2], "Groww"
+        except Exception:
+            continue
+
+    return [], None
+
+
+@app.get("/fii-dii")
+def fii_dii():
+    rows, source = _m_cached("fii_dii", 1800, _m_fetch_fii_dii)
+    if not rows:
+        raise HTTPException(503, "FII/DII data is temporarily unavailable — all sources are "
+                                 "blocking this server right now.")
+    date = rows[0].get("date", "") if rows else ""
+    return {"date": date, "source": source, "flows": rows}
+
+
+@app.get("/fii-dii/history")
+def fii_dii_history(days: int = 30):
+    def _compute():
+        import io as _mio
+        import requests
+        from datetime import date as _mdate
+
+        base = "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.php"
+        prev = _mdate.today().replace(day=1) - _mpd.Timedelta(days=1)
+        urls = [base, f"{base}?mon_year={prev.strftime('%m-%Y')}", f"{base}?mon_year={prev.strftime('%b-%Y')}"]
+
+        s = requests.Session()
+        s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                          "Referer": "https://www.moneycontrol.com/"})
+        frames = []
+        for url in urls:
+            try:
+                r = s.get(url, timeout=12)
+                r.raise_for_status()
+                for t in _mpd.read_html(_mio.StringIO(r.text)):
+                    if t.shape[1] >= 7:
+                        t = t.iloc[:, :7].copy()
+                        t.columns = ["date", "fii_buy", "fii_sell", "fii_net", "dii_buy", "dii_sell", "dii_net"]
+                        frames.append(t)
+                        break
+            except Exception:
+                continue
+
+        rows, _source = _m_fetch_fii_dii()
+        today_row = None
+        if rows:
+            try:
+                fii = next(r for r in rows if r["who"] == "FII")
+                dii = next(r for r in rows if r["who"] == "DII")
+                today_row = _mpd.DataFrame([{
+                    "date": _mpd.to_datetime(fii["date"], dayfirst=True, errors="coerce"),
+                    "fii_net": fii["net"], "dii_net": dii["net"],
+                }])
+            except Exception:
+                today_row = None
+
+        parts = frames + ([today_row] if today_row is not None else [])
+        if not parts:
+            return []
+        df = _mpd.concat(parts, ignore_index=True)
+        df["date"] = _mpd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+        df = df.dropna(subset=["date", "fii_net", "dii_net"]) if "fii_net" in df.columns else df.dropna(subset=["date"])
+        df = df.drop_duplicates(subset="date", keep="last").sort_values("date", ascending=False)
+        out = []
+        for _, r2 in df.head(days).iterrows():
+            out.append({
+                "date": r2["date"].strftime("%d-%b-%Y"),
+                "fii_net": None if _mpd.isna(r2.get("fii_net")) else round(float(r2["fii_net"]), 1),
+                "dii_net": None if _mpd.isna(r2.get("dii_net")) else round(float(r2["dii_net"]), 1),
+            })
+        return out
+
+    history = _m_cached(f"fii_dii_history:{days}", 6 * 3600, _compute)
+    if not history:
+        raise HTTPException(503, "No FII/DII history available right now — the data source is "
+                                 "unreachable from this server.")
+    fii_total = sum(h["fii_net"] for h in history if h["fii_net"] is not None)
+    dii_total = sum(h["dii_net"] for h in history if h["dii_net"] is not None)
+    buying_days = sum(1 for h in history if (h["fii_net"] or 0) > 0)
+    return {
+        "history": history,
+        "summary": {
+            "fii_net_total": round(fii_total, 1), "dii_net_total": round(dii_total, 1),
+            "combined_net": round(fii_total + dii_total, 1),
+            "fii_buying_days": buying_days, "total_days": len(history),
+        },
+    }
+
+
+# =============================================================================
+# MARKET NEWS
+# =============================================================================
+_M_FEEDS = {
+    "Economic Times Markets": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+    "ET Stocks": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms",
+    "Moneycontrol Markets": "https://www.moneycontrol.com/rss/marketreports.xml",
+    "Moneycontrol Business": "https://www.moneycontrol.com/rss/business.xml",
+    "Livemint Markets": "https://www.livemint.com/rss/markets",
+    "Business Standard Markets": "https://www.business-standard.com/rss/markets-106.rss",
+}
+_M_POSITIVE_WORDS = ("surge", "rally", "gain", "jump", "rise", "record high", "profit", "beats",
+                    "upgrade", "bullish", "soar", "growth", "strong", "boost", "buy", "outperform",
+                    "up ", "hits high", "best")
+_M_NEGATIVE_WORDS = ("fall", "drop", "crash", "plunge", "loss", "decline", "slump", "downgrade",
+                    "bearish", "weak", "cuts", "misses", "sell-off", "selloff", "tumble", "down ",
+                    "fears", "worst", "fraud", "probe")
+_M_HIGH_IMPACT_WORDS = ("rbi", "sebi", "fed", "budget", "gdp", "inflation", "rate cut", "rate hike",
+                        "war", "sanctions", "crisis")
+
+
+def _m_classify_sentiment(text: str) -> str:
+    t = text.lower()
+    pos = sum(w in t for w in _M_POSITIVE_WORDS)
+    neg = sum(w in t for w in _M_NEGATIVE_WORDS)
+    if pos > neg:
+        return "Positive"
+    if neg > pos:
+        return "Negative"
+    return "Neutral"
+
+
+def _m_classify_impact(text: str) -> str:
+    hits = sum(w in text.lower() for w in _M_HIGH_IMPACT_WORDS)
+    return "High" if hits >= 2 else ("Medium" if hits == 1 else "Low")
+
+
+def _m_strip_html(s: str) -> str:
+    s = _mre.sub(r"<[^>]+>", " ", s or "")
+    return _mhtml.unescape(_mre.sub(r"\s+", " ", s)).strip()
+
+
+def _m_age_str(dt) -> str:
+    if dt is None:
+        return ""
+    delta = _mdatetime.now(_mtimezone.utc) - dt
+    mins = int(delta.total_seconds() // 60)
+    if mins < 60:
+        return f"{mins} mins ago"
+    hrs = mins // 60
+    if hrs < 24:
+        return f"{hrs} hrs ago"
+    return f"{hrs // 24} days ago"
+
+
+def _m_extract_image(entry, raw_summary: str) -> str:
+    try:
+        for m in getattr(entry, "media_content", []) or []:
+            url = m.get("url", "")
+            if url.startswith("http"):
+                return url
+        for m in getattr(entry, "media_thumbnail", []) or []:
+            url = m.get("url", "")
+            if url.startswith("http"):
+                return url
+        for enc in getattr(entry, "enclosures", []) or []:
+            if "image" in enc.get("type", "") and enc.get("href", "").startswith("http"):
+                return enc["href"]
+        m = _mre.search(r'<img[^>]+src=["\'](http[^"\']+)["\']', raw_summary or "")
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def _m_fetch_news():
+    import feedparser
+    rows = []
+    for source, url in _M_FEEDS.items():
+        try:
+            feed = feedparser.parse(url)
+            for e in feed.entries[:15]:
+                title = _m_strip_html(getattr(e, "title", ""))
+                raw_summary = getattr(e, "summary", "")
+                summary = _m_strip_html(raw_summary)[:400]
+                if not title:
+                    continue
+                image = _m_extract_image(e, raw_summary)
+                published = None
+                for attr in ("published_parsed", "updated_parsed"):
+                    tp = getattr(e, attr, None)
+                    if tp:
+                        published = _mdatetime(*tp[:6], tzinfo=_mtimezone.utc)
+                        break
+                text = f"{title} {summary}"
+                rows.append({
+                    "title": title, "summary": summary, "link": getattr(e, "link", ""),
+                    "source": source, "_published": published, "image": image,
+                    "sentiment": _m_classify_sentiment(text), "impact": _m_classify_impact(text),
+                })
+        except Exception:
+            continue
+    seen_titles = set()
+    unique = []
+    for r in rows:
+        if r["title"] in seen_titles:
+            continue
+        seen_titles.add(r["title"])
+        unique.append(r)
+    unique.sort(key=lambda r: r["_published"] or _mdatetime.min.replace(tzinfo=_mtimezone.utc), reverse=True)
+    return unique
+
+
+@app.get("/news")
+def news(limit: int = 60, sentiment: str = "", impact: str = ""):
+    rows = _m_cached("news", 600, _m_fetch_news)
+    filtered = rows
+    if sentiment:
+        filtered = [r for r in filtered if r["sentiment"].lower() == sentiment.lower()]
+    if impact:
+        filtered = [r for r in filtered if r["impact"].lower() == impact.lower()]
+    filtered = filtered[:limit]
+
+    articles = [{
+        "title": r["title"], "summary": r["summary"], "source": r["source"],
+        "link": r["link"], "image": r["image"], "sentiment": r["sentiment"],
+        "impact": r["impact"], "age": _m_age_str(r["_published"]),
+    } for r in filtered]
+
+    positive = sum(1 for r in rows if r["sentiment"] == "Positive")
+    negative = sum(1 for r in rows if r["sentiment"] == "Negative")
+    high_impact = sum(1 for r in rows if r["impact"] == "High")
+
+    return {
+        "count": len(articles), "articles": articles,
+        "summary": {"positive": positive, "negative": negative, "high_impact": high_impact},
+        "sources": sorted(set(r["source"] for r in rows)),
+    }
+
 @app.get("/quote/{symbol}")
 def live_quote(symbol: str):
     """
