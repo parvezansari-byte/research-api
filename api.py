@@ -823,6 +823,18 @@ def stock_detail(symbol: str):
     if not signals:
         raise HTTPException(404, f"No price data for '{symbol}'")
 
+    # get_fundamentals() already detects Yahoo returning a near-empty
+    # response without raising (rate-limiting) and flags it via
+    # _fetch_failed - previously this endpoint ignored that flag and
+    # returned the empty data as if it were real, which is exactly why
+    # Fundamental Ratios showed blank instead of an error the app could
+    # retry on.
+    if fundamentals.get("_fetch_failed"):
+        raise HTTPException(
+            503, f"Fundamental data for '{symbol}' is temporarily unavailable "
+                 "— the data source is rate-limiting this server. Try again shortly."
+        )
+
     # Fix dividend yield units: Yahoo now returns this already as a percent
     # (e.g. 0.46 = 0.46%), but the engine multiplies by 100 → 46%. Undo that.
     dy = fundamentals.get("dividend_yield_pct")
