@@ -164,6 +164,45 @@ def stock_list():
     return {"count": len(names), "symbols": sorted(names)}
 
 
+@app.get("/stocks/list/detailed")
+def stock_list_detailed():
+    """
+    Same ~500-name universe as /stocks/list, but with sector and market-cap
+    category attached to each symbol - lets the app filter the search bar
+    by sector/cap instead of just matching on symbol text. Uses the same
+    get_universe_with_sectors() the web app's Screener already relies on,
+    so sector names stay consistent across both platforms.
+    """
+    from analysis_api import get_universe_with_sectors
+
+    rows: list[dict] = []
+    seen = set()
+    for cap in ("LARGECAP", "MIDCAP", "SMALLCAP"):
+        try:
+            symbols, sector_map = get_universe_with_sectors(cap)
+        except Exception:
+            continue
+        for sym in symbols:
+            s = sym.replace(".NS", "")
+            if s in seen:
+                continue
+            seen.add(s)
+            rows.append({
+                "symbol": s,
+                "sector": sector_map.get(sym) or "Other",
+                "cap": cap,
+            })
+
+    if not rows:
+        rows = [{"symbol": s, "sector": "Other", "cap": "LARGECAP"} for s in
+                ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "ITC",
+                 "SBIN", "BHARTIARTL", "LT", "KOTAKBANK"]]
+
+    sectors = sorted(set(r["sector"] for r in rows))
+    rows.sort(key=lambda r: r["symbol"])
+    return {"count": len(rows), "stocks": rows, "sectors": sectors}
+
+
 @app.get("/quote/{symbol}")
 def live_quote(symbol: str):
     """
