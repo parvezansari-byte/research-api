@@ -138,15 +138,16 @@ def market_indices():
 @app.get("/stocks/list")
 def stock_list():
     """
-    The full searchable universe (~500 names): NIFTY 100 + Midcap 150 +
-    Smallcap 250. Just the symbols — full data loads when a stock is opened.
-    Cached implicitly by clients; the list changes rarely.
+    The full searchable universe (~2000 names): NIFTY 100 + Midcap 150 +
+    Smallcap 250 + every other NSE-listed equity. Just the symbols — full
+    data loads when a stock is opened. Cached implicitly by clients; the
+    list changes rarely.
     """
     from analysis_api import get_universe
 
     names: list[str] = []
     seen = set()
-    for uni in ("LARGECAP", "MIDCAP", "SMALLCAP"):
+    for uni in ("LARGECAP", "MIDCAP", "SMALLCAP", "ALLEQUITIES"):
         try:
             for sym in get_universe(uni):
                 s = sym.replace(".NS", "")
@@ -167,17 +168,21 @@ def stock_list():
 @app.get("/stocks/list/detailed")
 def stock_list_detailed():
     """
-    Same ~500-name universe as /stocks/list, but with sector and market-cap
+    Same ~2000-name universe as /stocks/list, with sector and market-cap
     category attached to each symbol - lets the app filter the search bar
     by sector/cap instead of just matching on symbol text. Uses the same
     get_universe_with_sectors() the web app's Screener already relies on,
-    so sector names stay consistent across both platforms.
+    so sector names stay consistent across both platforms. The top ~500
+    (LARGECAP/MIDCAP/SMALLCAP) get real sector names from NSE's index
+    files; the remaining ~1500 (ALLEQUITIES) come back as "Uncategorized"
+    since NSE's full equity list doesn't carry sector data - shown
+    honestly rather than guessed.
     """
     from analysis_api import get_universe_with_sectors
 
     rows: list[dict] = []
     seen = set()
-    for cap in ("LARGECAP", "MIDCAP", "SMALLCAP"):
+    for cap in ("LARGECAP", "MIDCAP", "SMALLCAP", "ALLEQUITIES"):
         try:
             symbols, sector_map = get_universe_with_sectors(cap)
         except Exception:
