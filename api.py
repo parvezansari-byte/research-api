@@ -930,6 +930,154 @@ def screener(universe: str = "LARGECAP", limit: int = 100):
 # ===========================================================================
 # MUTUAL FUNDS
 # ===========================================================================
+
+# =============================================================================
+# FUNDS DATABASE — AMFI daily NAV + fund metrics (funds_data.json)
+# =============================================================================
+# Same situation as Holdings Explorer and the market-data routes: this
+# functionality existed on the previously-running Render instance but was
+# never in the GitHub source. Rebuilt from funds_data.json (2085 funds,
+# already present in the repo) with every field name matched directly
+# against funds_screen.dart's actual usage.
+# =============================================================================
+
+import json as _fj
+import os as _fo
+
+_FUNDS_DATA: list | None = None
+
+_FUND_SHEET_LABELS = {"equity": "Equity", "debt": "Debt", "hybrid": "Hybrid", "fof": "FoFs"}
+
+
+def _load_funds_data() -> list:
+    global _FUNDS_DATA
+    if _FUNDS_DATA is None:
+        path = _fo.path.join(_fo.path.dirname(__file__), "funds_data.json")
+        with open(path, encoding="utf-8") as f:
+            _FUNDS_DATA = _fj.load(f)
+    return _FUNDS_DATA
+
+
+def _fund_category_name(fund: dict) -> str:
+    """'Equity : Flexi Cap' -> 'Flexi Cap' (strip the sheet-level prefix
+    funds_screen.dart doesn't need, since it groups by sheet separately)."""
+    classification = fund.get("classification") or ""
+    if " : " in classification:
+        return classification.split(" : ", 1)[1].strip()
+    return classification.strip() or "Other"
+
+
+@app.get("/funds/db/categories")
+def funds_db_categories():
+    """Every fund grouped by sheet (Equity/Debt/Hybrid/FoFs), then by
+    category name within each - matches the {group, categories:[{name,
+    count}]} shape funds_screen.dart reads directly."""
+    data = _load_funds_data()
+    by_sheet: dict = {}
+    for fund in data:
+        sheet = fund.get("sheet") or "equity"
+        label = _FUND_SHEET_LABELS.get(sheet, sheet.title())
+        cat_name = _fund_category_name(fund)
+        by_sheet.setdefault(label, {}).setdefault(cat_name, 0)
+        by_sheet[label][cat_name] += 1
+
+    # Equity first (funds_screen.dart opens on it by default), then a
+    # sensible fixed order for the rest, alphabetical for anything new.
+    sheet_order = ["Equity", "Debt", "Hybrid", "FoFs"]
+    groups = []
+    for label in sheet_order + sorted(set(by_sheet) - set(sheet_order)):
+        if label not in by_sheet:
+            continue
+        cats = [{"name": name, "count": count} for name, count in by_sheet[label].items()]
+        cats.sort(key=lambda c: -c["count"])
+        groups.append({"group": label, "categories": cats})
+
+    return {"groups": groups}
+
+
+def _fund_public_fields(fund: dict) -> dict:
+    """Every field funds_screen.dart reads for a fund card/detail row,
+    passed straight through from the JSON. nav_live/nav_date/
+    nav_change_pct are honestly None - this snapshot doesn't carry a
+    live intraday NAV feed, unlike the rest of the static metrics."""
+    return {
+        "name": fund.get("name"), "classification": fund.get("classification"),
+        "manager": fund.get("manager"), "amc": fund.get("amc"),
+        "nav": fund.get("nav"), "nav_live": False, "nav_date": None, "nav_change_pct": None,
+        "nav_52w_high": fund.get("nav_52w_high"), "nav_52w_low": fund.get("nav_52w_low"),
+        "r_1m": fund.get("r_1m"), "r_3m": fund.get("r_3m"), "r_6m": fund.get("r_6m"),
+        "r_1y": fund.get("r_1y"), "r_2y": fund.get("r_2y"), "r_3y": fund.get("r_3y"),
+        "r_5y": fund.get("r_5y"), "r_10y": fund.get("r_10y"),
+        "aum": fund.get("aum"), "expense_ratio": fund.get("expense_ratio"),
+        "benchmark": fund.get("benchmark"), "inception": fund.get("inception"),
+        "fund_type": fund.get("fund_type"), "exit_load": fund.get("exit_load"),
+        "sharpe": fund.get("sharpe"), "sortino": fund.get("sortino"),
+        "alpha": fund.get("alpha"), "beta": fund.get("beta"), "std_dev": fund.get("std_dev"),
+        "pe": fund.get("pe"), "turnover": fund.get("turnover"), "avg_mcap": fund.get("avg_mcap"),
+        "pct_large": fund.get("pct_large"), "pct_mid": fund.get("pct_mid"), "pct_small": fund.get("pct_small"),
+        "top_sector": fund.get("top_sector"), "avg_maturity": fund.get("avg_maturity"),
+        "mod_duration": fund.get("mod_duration"), "ytm": fund.get("ytm"),
+        "key": fund.get("key"),
+    }
+
+
+@app.get("/funds/db/list")
+def funds_db_list(category: str, sort: str = "aum", limit: int = 60):
+    data = _load_funds_data()
+    matches = [f for f in data if _fund_category_name(f) == category]
+    total_in_category = len(matches)
+
+    reverse = sort not in ("expense_ratio",)  # lower expense ratio ranks first
+    matches.sort(key=lambda f: (f.get(sort) is None, f.get(sort) or 0), reverse=reverse)
+
+    shown = matches[:limit]
+    nav_matched = sum(1 for f in shown if f.get("nav") is not None)
+
+    return {
+        "funds": [_fund_public_fields(f) for f in shown],
+        "count": len(shown), "nav_matched": nav_matched, "total_in_category": total_in_category,
+    }
+
+
+@app.get("/funds/db/search")
+def funds_db_search(q: str):
+    data = _load_funds_data()
+    query = q.strip().lower()
+    if len(query) < 2:
+        raise HTTPException(400, "Query must be at least 2 characters")
+    matches = [f for f in data if query in (f.get("name") or "").lower()][:40]
+    return {"funds": [_fund_public_fields(f) for f in matches]}
+
+
+@app.get("/funds/db/fund")
+def funds_db_fund(name: str):
+    data = _load_funds_data()
+    target_key = name.strip().lower()
+    match = next((f for f in data if (f.get("key") or "").lower() == target_key
+                 or (f.get("name") or "").lower() == target_key), None)
+    if not match:
+        raise HTTPException(404, f"Fund '{name}' not found")
+
+    peers = [f for f in data if _fund_category_name(f) == _fund_category_name(match)]
+
+    def _rank_of(field: str, higher_is_better: bool):
+        vals = [(f.get("key"), f.get(field)) for f in peers if f.get(field) is not None]
+        if not vals or match.get(field) is None:
+            return None
+        vals.sort(key=lambda v: v[1], reverse=higher_is_better)
+        for i, (k, _) in enumerate(vals):
+            if k == match.get("key"):
+                return {"rank": i + 1, "of": len(vals)}
+        return None
+
+    result = _fund_public_fields(match)
+    result["ranks"] = {
+        "aum": _rank_of("aum", higher_is_better=True),
+        "expense_ratio": _rank_of("expense_ratio", higher_is_better=False),
+        "sharpe": _rank_of("sharpe", higher_is_better=True),
+    }
+    return result
+
 @app.get("/funds/search")
 def fund_search(q: str):
     """Search all Indian mutual funds by name."""
