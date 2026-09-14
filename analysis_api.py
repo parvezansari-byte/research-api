@@ -26,6 +26,40 @@ import yfinance as yf
 
 logger = logging.getLogger("analysis_api")
 
+# ---------------------------------------------------------------------- #
+# Fundamentals cache (Yahoo blocks Render's IP on the .info endpoint -
+# fetch_fundamentals_cache.py builds this file from a non-blocked
+# network; see that script's docstring for the full story)
+# ---------------------------------------------------------------------- #
+import json as _json
+import os as _os
+
+_FUNDAMENTALS_CACHE_FILE = _os.path.join(
+    _os.path.dirname(_os.path.abspath(__file__)), "fundamentals_cache.json"
+)
+_FUNDAMENTALS_CACHE: dict = {}
+
+
+def _load_fundamentals_cache() -> dict:
+    global _FUNDAMENTALS_CACHE
+    if _FUNDAMENTALS_CACHE:
+        return _FUNDAMENTALS_CACHE
+    try:
+        with open(_FUNDAMENTALS_CACHE_FILE, "r", encoding="utf-8") as f:
+            _FUNDAMENTALS_CACHE = _json.load(f)
+        logger.info("Loaded %d cached fundamentals from %s",
+                    len(_FUNDAMENTALS_CACHE), _FUNDAMENTALS_CACHE_FILE)
+    except FileNotFoundError:
+        logger.warning(
+            "%s not found - fundamentals will rely entirely on live Yahoo "
+            "calls, which are currently blocked from this server. Run "
+            "fetch_fundamentals_cache.py from a non-cloud network to "
+            "generate this file.", _FUNDAMENTALS_CACHE_FILE,
+        )
+    except Exception as e:
+        logger.warning("Failed to load fundamentals cache: %s", e)
+    return _FUNDAMENTALS_CACHE
+
 # Yahoo Finance blocks the plain `requests` library's TLS/HTTP fingerprint
 # from cloud-hosting IPs (Render, AWS, etc.) with 401/429 errors on the
 # quoteSummary endpoint that .info relies on - price history keeps working
@@ -324,12 +358,22 @@ def _safe(d: dict, key, scale=1.0, nd=2):
 def get_fundamentals(symbol: str) -> dict:
     """Key fundamental ratios for one stock (from Yahoo's info + statements).
 
-    Sets _fetch_failed=True when Yahoo's response is empty/near-empty
-    (its usual behaviour when rate-limiting a server instead of raising
-    a clean error) so the API layer can return a proper 503 instead of
-    silently serving blank fields. Any exception is also logged with the
-    real Yahoo error text, since yfinance often swallows the HTTP status.
+    Checks the local fundamentals_cache.json first (built by
+    fetch_fundamentals_cache.py from a network Yahoo doesn't block) and
+    only falls back to a live Yahoo call - which fails on Render - if the
+    symbol isn't cached. Sets _fetch_failed=True when Yahoo's response is
+    empty/near-empty (its usual behaviour when rate-limiting a server
+    instead of raising a clean error) so the API layer can return a
+    proper 503 instead of silently serving blank fields.
     """
+    cache = _load_fundamentals_cache()
+    cached = cache.get(symbol)
+    if cached is not None:
+        result = dict(cached)
+        result["_fetch_failed"] = False
+        result["_from_cache"] = True
+        return result
+
     t = _yf_ticker(symbol)
     try:
         info = t.info or {}
