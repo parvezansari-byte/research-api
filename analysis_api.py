@@ -60,6 +60,49 @@ def _load_fundamentals_cache() -> dict:
         logger.warning("Failed to load fundamentals cache: %s", e)
     return _FUNDAMENTALS_CACHE
 
+
+# ---------------------------------------------------------------------- #
+# ISIN / company-name lookup, built from the NSE cache files already on
+# disk (nse_largecap_sectors.csv etc. - see get_universe_with_sectors).
+# Used to show a real company name and a logo (fetched by ISIN from a
+# public logo CDN) on the stock detail screen, which calls
+# get_fundamentals() rather than /stocks/list/detailed.
+# ---------------------------------------------------------------------- #
+_ISIN_NAME_CACHE_FILES = [
+    "nse_largecap_sectors.csv",
+    "nse_midcap_sectors.csv",
+    "nse_smallcap_sectors.csv",
+    "nse_allequities.csv",
+]
+_ISIN_MAP: dict = {}
+_NAME_MAP: dict = {}
+_ISIN_MAP_LOADED = False
+
+
+def _load_isin_name_maps() -> tuple[dict, dict]:
+    global _ISIN_MAP_LOADED
+    if _ISIN_MAP_LOADED:
+        return _ISIN_MAP, _NAME_MAP
+    for fname in _ISIN_NAME_CACHE_FILES:
+        if not _os.path.exists(fname):
+            continue
+        try:
+            df = pd.read_csv(fname)
+            _, _, name_map, isin_map = _extract_symbols_sectors_names(df)
+            # Earlier files in the list (index constituents) have cleaner
+            # names than the full-equity dump, so don't overwrite existing
+            # entries once set.
+            for sym, name in name_map.items():
+                _NAME_MAP.setdefault(sym, name)
+            for sym, isin in isin_map.items():
+                _ISIN_MAP.setdefault(sym, isin)
+        except Exception as e:
+            logger.warning("Failed to load %s for ISIN/name lookup: %s", fname, e)
+    _ISIN_MAP_LOADED = True
+    logger.info("Loaded ISIN/name lookup for %d symbols", len(_ISIN_MAP))
+    return _ISIN_MAP, _NAME_MAP
+
+
 # Yahoo Finance blocks the plain `requests` library's TLS/HTTP fingerprint
 # from cloud-hosting IPs (Render, AWS, etc.) with 401/429 errors on the
 # quoteSummary endpoint that .info relies on - price history keeps working
@@ -398,12 +441,17 @@ def get_fundamentals(symbol: str) -> dict:
     instead of raising a clean error) so the API layer can return a
     proper 503 instead of silently serving blank fields.
     """
+    isin_map, name_map = _load_isin_name_maps()
+
     cache = _load_fundamentals_cache()
     cached = cache.get(symbol)
     if cached is not None:
         result = dict(cached)
         result["_fetch_failed"] = False
         result["_from_cache"] = True
+        result["isin"] = isin_map.get(symbol)
+        if name_map.get(symbol):
+            result["name"] = name_map[symbol]
         return result
 
     t = _yf_ticker(symbol)
@@ -428,7 +476,8 @@ def get_fundamentals(symbol: str) -> dict:
         )
 
     f = {
-        "name": info.get("longName", symbol),
+        "name": name_map.get(symbol) or info.get("longName", symbol),
+        "isin": isin_map.get(symbol),
         "sector": info.get("sector"),
         "industry": info.get("industry"),
         "market_cap_cr": _safe(info, "marketCap", 1e-7, 0),   # ₹ crore
