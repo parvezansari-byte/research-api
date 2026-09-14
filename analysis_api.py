@@ -133,6 +133,84 @@ def get_universe(which: str = "BOTH") -> list[str]:
     return [f"{s}.NS" for s in out]
 
 
+_ALLEQUITIES_URL = "https://archives.nseindia.com/content/equity_L.csv"
+
+
+def _extract_symbols_and_sectors(df: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
+    """Pulls Symbol + Industry (if present) out of an NSE constituent CSV."""
+    col = "Symbol" if "Symbol" in df.columns else df.columns[2]
+    industry_col = next(
+        (c for c in ("Industry", "Sector", "Industry Name") if c in df.columns), None
+    )
+    symbols = df[col].astype(str).str.strip().tolist()
+    sector_map: dict[str, str] = {}
+    if industry_col:
+        for sym, sect in zip(symbols, df[industry_col].astype(str).str.strip()):
+            sector_map[f"{sym}.NS"] = sect
+    return symbols, sector_map
+
+
+def get_universe_with_sectors(cap: str) -> tuple[list[str], dict[str, str]]:
+    """
+    Like get_universe(), but also returns a {symbol.NS: sector} map built
+    from the same NSE constituent CSVs' "Industry" column, so the Screener
+    and /stocks/list/detailed can show real sector names from one source.
+    ALLEQUITIES pulls NSE's full listed-securities file instead, which
+    carries no sector column, so those symbols come back unmapped (the
+    caller shows them as "Uncategorized"/"Other" - shown honestly rather
+    than guessed).
+    """
+    import os
+    cap = cap.upper().replace(" ", "")
+
+    if cap == "ALLEQUITIES":
+        cache_file = "nse_allequities.csv"
+        try:
+            r = requests.get(
+                _ALLEQUITIES_URL, timeout=20,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            col = "SYMBOL" if "SYMBOL" in df.columns else df.columns[0]
+            symbols = df[col].astype(str).str.strip().tolist()
+            if len(symbols) < 500:
+                raise RuntimeError("Unexpectedly short ALLEQUITIES list")
+            df.to_csv(cache_file, index=False)
+            return [f"{s}.NS" for s in symbols], {}
+        except Exception as e:
+            logger.warning("NSE full equity list fetch failed: %s", e)
+            if os.path.exists(cache_file):
+                symbols = pd.read_csv(cache_file)["SYMBOL"].astype(str).tolist()
+                return [f"{s}.NS" for s in symbols], {}
+            raise
+
+    if cap not in NSE_LISTS:
+        raise ValueError(f"Unknown universe: {cap}")
+
+    cache_file = f"nse_{cap.lower()}_sectors.csv"
+    try:
+        r = requests.get(
+            NSE_LISTS[cap], timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        symbols, sector_map = _extract_symbols_and_sectors(df)
+        if len(symbols) >= _MIN_COUNT.get(cap, 45):
+            df.to_csv(cache_file, index=False)
+            return [f"{s}.NS" for s in symbols], sector_map
+    except Exception as e:
+        logger.warning("NSE sector list fetch failed for %s: %s", cap, e)
+
+    if os.path.exists(cache_file):
+        cached = pd.read_csv(cache_file)
+        symbols, sector_map = _extract_symbols_and_sectors(cached)
+        return [f"{s}.NS" for s in symbols], sector_map
+
+    raise RuntimeError(f"Could not load sector data for {cap}")
+
+
 # ---------------------------------------------------------------------- #
 # Technical indicators (computed with pandas — no extra deps)
 # ---------------------------------------------------------------------- #
