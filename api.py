@@ -168,9 +168,10 @@ def stock_list():
 @app.get("/stocks/list/detailed")
 def stock_list_detailed():
     """
-    Same ~2000-name universe as /stocks/list, with sector and market-cap
-    category attached to each symbol - lets the app filter the search bar
-    by sector/cap instead of just matching on symbol text. Uses the same
+    Same ~2000-name universe as /stocks/list, with sector, company name,
+    ISIN, and market-cap category attached to each symbol - lets the app
+    filter the search bar by sector/cap, show full names, and look up a
+    logo (by ISIN) instead of just matching on symbol text. Uses the same
     get_universe_with_sectors() the web app's Screener already relies on,
     so sector names stay consistent across both platforms. The top ~500
     (LARGECAP/MIDCAP/SMALLCAP) get real sector names from NSE's index
@@ -184,7 +185,7 @@ def stock_list_detailed():
     seen = set()
     for cap in ("LARGECAP", "MIDCAP", "SMALLCAP", "ALLEQUITIES"):
         try:
-            symbols, sector_map = get_universe_with_sectors(cap)
+            symbols, sector_map, name_map, isin_map = get_universe_with_sectors(cap)
         except Exception:
             continue
         for sym in symbols:
@@ -194,14 +195,18 @@ def stock_list_detailed():
             seen.add(s)
             rows.append({
                 "symbol": s,
+                "name": name_map.get(sym) or s,
+                "isin": isin_map.get(sym),
                 "sector": sector_map.get(sym) or "Other",
                 "cap": cap,
             })
 
     if not rows:
-        rows = [{"symbol": s, "sector": "Other", "cap": "LARGECAP"} for s in
+        rows = [{"symbol": s, "name": s, "isin": None, "sector": "Other",
+                  "cap": "LARGECAP"} for s in
                 ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "ITC",
                  "SBIN", "BHARTIARTL", "LT", "KOTAKBANK"]]
+
 
     sectors = sorted(set(r["sector"] for r in rows))
     rows.sort(key=lambda r: r["symbol"])
