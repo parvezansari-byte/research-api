@@ -322,9 +322,34 @@ def _safe(d: dict, key, scale=1.0, nd=2):
 
 
 def get_fundamentals(symbol: str) -> dict:
-    """Key fundamental ratios for one stock (from Yahoo's info + statements)."""
+    """Key fundamental ratios for one stock (from Yahoo's info + statements).
+
+    Sets _fetch_failed=True when Yahoo's response is empty/near-empty
+    (its usual behaviour when rate-limiting a server instead of raising
+    a clean error) so the API layer can return a proper 503 instead of
+    silently serving blank fields. Any exception is also logged with the
+    real Yahoo error text, since yfinance often swallows the HTTP status.
+    """
     t = _yf_ticker(symbol)
-    info = t.info or {}
+    try:
+        info = t.info or {}
+    except Exception as e:
+        logger.warning("yfinance .info failed for %s: %s", symbol, e)
+        info = {}
+
+    # Yahoo's rate-limited response still returns 200 with a dict, just
+    # missing almost every real field - a handful of keys like "symbol"
+    # survive even then, so require actual financial data to count as OK.
+    fetch_failed = not any(
+        info.get(k) is not None
+        for k in ("trailingPE", "marketCap", "sector", "returnOnEquity")
+    )
+    if fetch_failed:
+        logger.warning(
+            "get_fundamentals(%s): Yahoo returned near-empty info (%d keys) "
+            "- treating as rate-limited/failed. Sample keys: %s",
+            symbol, len(info), list(info.keys())[:10],
+        )
 
     f = {
         "name": info.get("longName", symbol),
@@ -358,6 +383,7 @@ def get_fundamentals(symbol: str) -> dict:
         # Cash
         "free_cashflow_cr": _safe(info, "freeCashflow", 1e-7, 0),
         "operating_cashflow_cr": _safe(info, "operatingCashflow", 1e-7, 0),
+        "_fetch_failed": fetch_failed,
     }
 
     # Interest coverage from the income statement if available
