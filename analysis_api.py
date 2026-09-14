@@ -195,29 +195,57 @@ def get_universe(which: str = "BOTH") -> list[str]:
 _ALLEQUITIES_URL = "https://archives.nseindia.com/content/equity_L.csv"
 
 
-def _extract_symbols_and_sectors(df: pd.DataFrame) -> tuple[list[str], dict[str, str]]:
-    """Pulls Symbol + Industry (if present) out of an NSE constituent CSV."""
-    col = "Symbol" if "Symbol" in df.columns else df.columns[2]
+def _extract_symbols_sectors_names(df: pd.DataFrame) -> tuple[
+        list[str], dict[str, str], dict[str, str], dict[str, str]]:
+    """Pulls Symbol + Industry + Company Name + ISIN (whichever are
+    present) out of an NSE constituent CSV. Column names differ between
+    the index-constituent files and the full-equity-list file, so this
+    checks a few candidates for each field.
+    """
+    df.columns = [c.strip() for c in df.columns]
+    col = "Symbol" if "Symbol" in df.columns else (
+        "SYMBOL" if "SYMBOL" in df.columns else df.columns[2])
     industry_col = next(
         (c for c in ("Industry", "Sector", "Industry Name") if c in df.columns), None
     )
+    name_col = next(
+        (c for c in ("Company Name", "NAME OF COMPANY") if c in df.columns), None
+    )
+    isin_col = next(
+        (c for c in ("ISIN Code", "ISIN NUMBER", "ISIN") if c in df.columns), None
+    )
+
     symbols = df[col].astype(str).str.strip().tolist()
     sector_map: dict[str, str] = {}
+    name_map: dict[str, str] = {}
+    isin_map: dict[str, str] = {}
+
     if industry_col:
         for sym, sect in zip(symbols, df[industry_col].astype(str).str.strip()):
             sector_map[f"{sym}.NS"] = sect
-    return symbols, sector_map
+    if name_col:
+        for sym, name in zip(symbols, df[name_col].astype(str).str.strip()):
+            name_map[f"{sym}.NS"] = name
+    if isin_col:
+        for sym, isin in zip(symbols, df[isin_col].astype(str).str.strip()):
+            isin_map[f"{sym}.NS"] = isin
+
+    return symbols, sector_map, name_map, isin_map
 
 
-def get_universe_with_sectors(cap: str) -> tuple[list[str], dict[str, str]]:
+def get_universe_with_sectors(cap: str) -> tuple[
+        list[str], dict[str, str], dict[str, str], dict[str, str]]:
     """
-    Like get_universe(), but also returns a {symbol.NS: sector} map built
-    from the same NSE constituent CSVs' "Industry" column, so the Screener
-    and /stocks/list/detailed can show real sector names from one source.
-    ALLEQUITIES pulls NSE's full listed-securities file instead, which
-    carries no sector column, so those symbols come back unmapped (the
-    caller shows them as "Uncategorized"/"Other" - shown honestly rather
-    than guessed).
+    Like get_universe(), but also returns:
+      - a {symbol.NS: sector} map
+      - a {symbol.NS: company name} map
+      - a {symbol.NS: ISIN} map
+    all built from the same NSE constituent CSVs, so the Screener and
+    /stocks/list/detailed can show real sector/name/logo data from one
+    source. ALLEQUITIES pulls NSE's full listed-securities file instead,
+    which has a name+ISIN but no sector column, so those symbols come
+    back with sector unmapped (the caller shows "Other" - shown honestly
+    rather than guessed).
     """
     import os
     cap = cap.upper().replace(" ", "")
@@ -231,17 +259,21 @@ def get_universe_with_sectors(cap: str) -> tuple[list[str], dict[str, str]]:
             )
             r.raise_for_status()
             df = pd.read_csv(io.StringIO(r.text))
+            df.columns = [c.strip() for c in df.columns]
             col = "SYMBOL" if "SYMBOL" in df.columns else df.columns[0]
             symbols = df[col].astype(str).str.strip().tolist()
             if len(symbols) < 500:
                 raise RuntimeError("Unexpectedly short ALLEQUITIES list")
             df.to_csv(cache_file, index=False)
-            return [f"{s}.NS" for s in symbols], {}
+            _, _, name_map, isin_map = _extract_symbols_sectors_names(df)
+            return [f"{s}.NS" for s in symbols], {}, name_map, isin_map
         except Exception as e:
             logger.warning("NSE full equity list fetch failed: %s", e)
             if os.path.exists(cache_file):
-                symbols = pd.read_csv(cache_file)["SYMBOL"].astype(str).tolist()
-                return [f"{s}.NS" for s in symbols], {}
+                cached = pd.read_csv(cache_file)
+                symbols = cached["SYMBOL"].astype(str).tolist()
+                _, _, name_map, isin_map = _extract_symbols_sectors_names(cached)
+                return [f"{s}.NS" for s in symbols], {}, name_map, isin_map
             raise
 
     if cap not in NSE_LISTS:
@@ -255,17 +287,17 @@ def get_universe_with_sectors(cap: str) -> tuple[list[str], dict[str, str]]:
         )
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
-        symbols, sector_map = _extract_symbols_and_sectors(df)
+        symbols, sector_map, name_map, isin_map = _extract_symbols_sectors_names(df)
         if len(symbols) >= _MIN_COUNT.get(cap, 45):
             df.to_csv(cache_file, index=False)
-            return [f"{s}.NS" for s in symbols], sector_map
+            return [f"{s}.NS" for s in symbols], sector_map, name_map, isin_map
     except Exception as e:
         logger.warning("NSE sector list fetch failed for %s: %s", cap, e)
 
     if os.path.exists(cache_file):
         cached = pd.read_csv(cache_file)
-        symbols, sector_map = _extract_symbols_and_sectors(cached)
-        return [f"{s}.NS" for s in symbols], sector_map
+        symbols, sector_map, name_map, isin_map = _extract_symbols_sectors_names(cached)
+        return [f"{s}.NS" for s in symbols], sector_map, name_map, isin_map
 
     raise RuntimeError(f"Could not load sector data for {cap}")
 
