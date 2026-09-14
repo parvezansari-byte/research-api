@@ -26,6 +26,31 @@ import yfinance as yf
 
 logger = logging.getLogger("analysis_api")
 
+# Yahoo Finance blocks the plain `requests` library's TLS/HTTP fingerprint
+# from cloud-hosting IPs (Render, AWS, etc.) with 401/429 errors on the
+# quoteSummary endpoint that .info relies on - price history keeps working
+# because it hits a less-restricted endpoint, which is why fundamentals
+# come back empty while technicals don't. curl_cffi impersonates a real
+# browser's fingerprint, which Yahoo doesn't block the same way. Every
+# yf.Ticker() / yf.download() call below shares this one session.
+try:
+    from curl_cffi import requests as _cffi_requests
+    _YF_SESSION = _cffi_requests.Session(impersonate="chrome")
+except ImportError:
+    logger.warning(
+        "curl_cffi not installed - falling back to yfinance's default "
+        "session, which Yahoo is likely to rate-limit on cloud hosts. "
+        "Add curl_cffi to requirements.txt to fix this."
+    )
+    _YF_SESSION = None
+
+
+def _yf_ticker(symbol: str) -> yf.Ticker:
+    """yf.Ticker() using the curl_cffi session when available."""
+    if _YF_SESSION is not None:
+        return yf.Ticker(symbol, session=_YF_SESSION)
+    return yf.Ticker(symbol)
+
 NSE_LISTS = {
     "NIFTY50": "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
     "NIFTYNEXT50": "https://archives.nseindia.com/content/indices/ind_niftynext50list.csv",
@@ -278,7 +303,7 @@ def technical_signals(df: pd.DataFrame) -> dict:
 
 def get_technicals(symbol: str, period: str = "2y"):
     """Price history with indicators + a signal summary for one stock."""
-    df = yf.Ticker(symbol).history(period=period)
+    df = _yf_ticker(symbol).history(period=period)
     if df.empty:
         return pd.DataFrame(), {}
     df = add_indicators(df)
@@ -298,7 +323,7 @@ def _safe(d: dict, key, scale=1.0, nd=2):
 
 def get_fundamentals(symbol: str) -> dict:
     """Key fundamental ratios for one stock (from Yahoo's info + statements)."""
-    t = yf.Ticker(symbol)
+    t = _yf_ticker(symbol)
     info = t.info or {}
 
     f = {
@@ -349,7 +374,7 @@ def get_fundamentals(symbol: str) -> dict:
 
 def get_statements(symbol: str) -> dict:
     """Annual + quarterly income statement, balance sheet, cash flow (₹ crore)."""
-    t = yf.Ticker(symbol)
+    t = _yf_ticker(symbol)
 
     def cr(df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
@@ -378,7 +403,8 @@ def scan_universe(symbols: list[str], progress_cb=None) -> pd.DataFrame:
     progress_cb(i, n, symbol) is called as each stock's info is fetched.
     """
     prices = yf.download(symbols, period="1y", group_by="ticker",
-                         auto_adjust=True, progress=False, threads=True)
+                         auto_adjust=True, progress=False, threads=True,
+                         session=_YF_SESSION)
 
     rows = []
     n = len(symbols)
@@ -406,7 +432,7 @@ def scan_universe(symbols: list[str], progress_cb=None) -> pd.DataFrame:
             pass
         # --- fundamentals (fast subset of info) ---
         try:
-            info = yf.Ticker(sym).info or {}
+            info = _yf_ticker(sym).info or {}
             row["mcap_cr"] = _safe(info, "marketCap", 1e-7, 0)
             row["PE"] = _safe(info, "trailingPE", nd=1)
             row["PB"] = _safe(info, "priceToBook", nd=1)
