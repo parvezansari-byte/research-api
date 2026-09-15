@@ -1000,6 +1000,64 @@ def funds_db_categories():
     return {"groups": groups}
 
 
+# AMC (fund house) name prefix -> official domain, used to fetch a real
+# logo via Google's public favicon service (keyless, no signup - Clearbit's
+# free logo API shut down Dec 2025 and its replacement requires an API key).
+# Deliberately only covers AMCs whose domain we're confident about; longer/
+# more specific prefixes are matched first so e.g. "Aditya Birla SL" matches
+# before a shorter, wrong prefix would. Anything not listed here simply gets
+# no logo and the app falls back to a colored initial - safer than risking
+# a wrong domain's favicon.
+_AMC_DOMAINS = [
+    ("Aditya Birla SL", "adityabirlacapital.com"),
+    ("Aditya Birla Sun Life", "adityabirlacapital.com"),
+    ("Axis", "axismf.com"),
+    ("Bajaj Finserv", "bajajamc.com"),
+    ("Bandhan", "bandhanmutual.com"),
+    ("Baroda BNP Paribas", "barodabnpparibasmf.in"),
+    ("Canara Rob", "canararobeco.com"),
+    ("DSP", "dspim.com"),
+    ("Edelweiss", "edelweissmf.com"),
+    ("Franklin", "franklintempletonindia.com"),
+    ("Groww", "groww.in"),
+    ("HDFC", "hdfcfund.com"),
+    ("HSBC", "assetmanagement.hsbc.co.in"),
+    ("ICICI Pru", "icicipruamc.com"),
+    ("Invesco", "invescomutualfund.com"),
+    ("ITI", "itimf.com"),
+    ("JM", "jmfinancialmf.com"),
+    ("Kotak", "kotakmf.com"),
+    ("LIC MF", "licmf.com"),
+    ("Mahindra Manulife", "mahindramanulife.com"),
+    ("Mirae Asset", "miraeassetmf.co.in"),
+    ("Motilal Oswal", "motilaloswalmf.com"),
+    ("Navi", "navi.com"),
+    ("Nippon India", "mf.nipponindiaim.com"),
+    ("NJ", "njmutualfund.com"),
+    ("Parag Parikh", "ppfas.com"),
+    ("PGIM India", "pgimindiamf.com"),
+    ("Quantum", "quantumamc.com"),
+    ("Quant", "quantmutual.com"),
+    ("SBI", "sbimf.com"),
+    ("Sundaram", "sundarammutual.com"),
+    ("Tata", "tatamutualfund.com"),
+    ("Taurus", "taurusmutualfund.com"),
+    ("TRUSTMF", "trustmf.com"),
+    ("UTI", "utimf.com"),
+    ("WOC", "whiteoakamc.com"),
+    ("360 ONE", "360one.com"),
+    ("Angel One", "angelone.in"),
+]
+
+
+def _amc_domain(fund_name: str) -> str | None:
+    """Longest-prefix match against the AMC map above."""
+    for prefix, domain in sorted(_AMC_DOMAINS, key=lambda p: -len(p[0])):
+        if fund_name.startswith(prefix):
+            return domain
+    return None
+
+
 def _fund_public_fields(fund: dict) -> dict:
     """Every field funds_screen.dart reads for a fund card/detail row,
     passed straight through from the JSON. nav_live/nav_date/
@@ -1023,6 +1081,7 @@ def _fund_public_fields(fund: dict) -> dict:
         "top_sector": fund.get("top_sector"), "avg_maturity": fund.get("avg_maturity"),
         "mod_duration": fund.get("mod_duration"), "ytm": fund.get("ytm"),
         "key": fund.get("key"),
+        "amc_domain": _amc_domain(fund.get("name") or ""),
     }
 
 
