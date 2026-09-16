@@ -346,6 +346,324 @@ def sectors(compare: str = "1y"):
         raise HTTPException(503, f"Could not load sector performance: {e}")
 
 
+def _now_ist_str() -> str:
+    from datetime import datetime, timedelta, timezone
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist).strftime("%d-%b-%Y %H:%M")
+
+
+# =============================================================================
+# MARKET MOOD  (composite Fear/Greed gauge, 5 signals)
+# =============================================================================
+def _mood_clip(v: float, lo: float = 0, hi: float = 100) -> float:
+    return max(lo, min(hi, v))
+
+
+def _m_compute_mood() -> dict:
+    scores = {}
+    details = {}
+
+    # 1. Volatility: India VIX (higher VIX -> more fear -> lower score)
+    try:
+        vix = _myf.Ticker("^INDIAVIX").history(period="5d")["Close"].dropna()
+        vix_now = float(vix.iloc[-1])
+        vix_score = _mood_clip(100 - (vix_now - 10) / (35 - 10) * 100)
+        scores["Volatility (India VIX)"] = vix_score
+        details["Volatility (India VIX)"] = f"VIX at {vix_now:.1f}"
+    except Exception:
+        pass
+
+    # 2. Momentum: Nifty 50 vs its 125-day moving average
+    try:
+        nifty = _myf.Ticker("^NSEI").history(period="8mo")["Close"].dropna()
+        ma125 = nifty.rolling(125).mean().iloc[-1]
+        cur = float(nifty.iloc[-1])
+        pct_above = (cur / ma125 - 1) * 100
+        mom_score = _mood_clip(50 + pct_above / 8 * 50)
+        scores["Momentum (vs 125-day avg)"] = mom_score
+        details["Momentum (vs 125-day avg)"] = f"{pct_above:+.1f}% vs its 125-day average"
+    except Exception:
+        pass
+
+    # 3. Sector breadth - reuses the same sector computation /sectors uses,
+    # so the two stay consistent instead of two separate implementations
+    # drifting apart.
+    try:
+        sec = _m_cached("sectors:1y", 3600, lambda: _m_compute_sectors("1y"))
+        with_1m = [s for s in sec.get("sectors", []) if s.get("return_1m") is not None]
+        if with_1m:
+            up = sum(1 for s in with_1m if s["return_1m"] > 0)
+            total = len(with_1m)
+            scores["Sector Breadth"] = up / total * 100
+            details["Sector Breadth"] = f"{up}/{total} sectors up over 1 month"
+    except Exception:
+        pass
+
+    # 4. Safe-haven demand: Gold vs Nifty, 1-month relative performance
+    try:
+        gold = _myf.Ticker("GC=F").history(period="2mo")["Close"].dropna()
+        nifty2 = _myf.Ticker("^NSEI").history(period="2mo")["Close"].dropna()
+        if len(gold) >= 22 and len(nifty2) >= 22:
+            gold_chg = gold.iloc[-1] / gold.iloc[-22] - 1
+            nifty_chg = nifty2.iloc[-1] / nifty2.iloc[-22] - 1
+            relative = (nifty_chg - gold_chg) * 100
+            scores["Safe-Haven Demand"] = _mood_clip(50 + relative / 10 * 50)
+            details["Safe-Haven Demand"] = (
+                f"Nifty {'beat' if relative > 0 else 'trailed'} gold by {abs(relative):.1f}pp (1M)")
+    except Exception:
+        pass
+
+    # 5. 52-week positioning: where Nifty sits in its own 52-week range
+    try:
+        nifty52 = _myf.Ticker("^NSEI").history(period="1y")["Close"].dropna()
+        lo, hi, cur52 = float(nifty52.min()), float(nifty52.max()), float(nifty52.iloc[-1])
+        scores["52-Week Positioning"] = _mood_clip((cur52 - lo) / (hi - lo) * 100) if hi > lo else 50
+        details["52-Week Positioning"] = f"\u20b9{cur52:,.0f} in a \u20b9{lo:,.0f}\u2013\u20b9{hi:,.0f} range"
+    except Exception:
+        pass
+
+    composite = sum(scores.values()) / len(scores) if scores else None
+    return {
+        "composite": round(composite, 1) if composite is not None else None,
+        "scores": {k: round(v, 1) for k, v in scores.items()},
+        "details": details,
+        "as_of": _now_ist_str(),
+    }
+
+
+def _mood_zone(score: float) -> tuple[str, str]:
+    if score < 25:
+        return "Extreme Fear", "#ef4444"
+    if score < 45:
+        return "Fear", "#f97316"
+    if score < 55:
+        return "Neutral", "#fbbf24"
+    if score < 75:
+        return "Greed", "#84cc16"
+    return "Extreme Greed", "#10b981"
+
+
+@app.get("/market/mood")
+def market_mood():
+    try:
+        result = dict(_m_cached("market_mood", 3600, _m_compute_mood))
+    except Exception as e:
+        raise HTTPException(503, f"Could not compute market mood: {e}")
+    if result["composite"] is None:
+        raise HTTPException(503, "Could not compute market mood right now - "
+                                  "market data may be temporarily unavailable")
+    zone, color = _mood_zone(result["composite"])
+    result["zone"] = zone
+    result["zone_color"] = color
+    return result
+
+
+@app.get("/market/mood/vix-history")
+def market_mood_vix_history(period: str = "6mo"):
+    def _fetch():
+        hist = _myf.Ticker("^INDIAVIX").history(period=period)["Close"].dropna()
+        return [{"date": str(idx.date()), "vix": round(float(v), 2)}
+                for idx, v in hist.items()]
+    try:
+        points = _m_cached(f"vix_history:{period}", 3600, _fetch)
+    except Exception as e:
+        raise HTTPException(503, f"Could not load VIX history: {e}")
+    return {"period": period, "points": points}
+
+
+@app.get("/market/mood/vix-intraday")
+def market_mood_vix_intraday():
+    def _fetch():
+        hist = _myf.Ticker("^INDIAVIX").history(period="1d", interval="5m")["Close"].dropna()
+        return [{"time": str(idx), "vix": round(float(v), 2)} for idx, v in hist.items()]
+    try:
+        points = _m_cached("vix_intraday", 120, _fetch)
+    except Exception as e:
+        raise HTTPException(503, f"Could not load intraday VIX: {e}")
+    return {"points": points}
+
+
+class MoodAIRequest(BaseModel):
+    composite: float
+    zone: str
+    as_of: str
+    scores: dict
+    details: dict
+
+
+@app.post("/market/mood/ai-analysis")
+def market_mood_ai_analysis(req: MoodAIRequest):
+    import os
+    try:
+        from google import genai
+    except ImportError:
+        raise HTTPException(500, "google-genai not installed")
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise HTTPException(500, "GEMINI_API_KEY not set on the server")
+
+    signal_lines = "\n".join(
+        f"- {name}: {score:.0f}/100 \u2014 {req.details.get(name, '')}"
+        for name, score in req.scores.items()
+    )
+    prompt = f"""You are a market analyst explaining a rules-based Fear/Greed gauge for the Indian stock market to a retail investor. You are NOT giving buy/sell advice.
+
+Composite score: {req.composite:.0f}/100 \u2014 {req.zone}
+As of: {req.as_of}
+
+Individual signals feeding the composite:
+{signal_lines}
+
+Write a clear, plain-English analysis, under 250 words, with these sections:
+**What's Driving This Reading** \u2014 which signals are pulling the score toward fear or greed, and why, based only on the numbers above.
+**Historical Context** \u2014 how readings in this zone ({req.zone}) have generally been interpreted (e.g. extreme fear sometimes preceding recoveries, extreme greed sometimes preceding pullbacks) \u2014 describe this as a general historical tendency, not a prediction.
+**Caveats** \u2014 1-2 honest limitations of this gauge (e.g. it's a simplified composite of 5 signals, not official; missing signals reduce reliability; sentiment can stay extreme for a long time).
+
+Rules: base everything ONLY on the data given above; invent no other numbers, news, or events. Do not recommend buying, selling, or any specific action. Add no other disclaimer; the app adds one."""
+
+    try:
+        client = genai.Client(api_key=key)
+        resp = client.models.generate_content(model="gemini-flash-latest", contents=prompt)
+        return {"analysis": (resp.text or "").strip()}
+    except Exception as e:
+        raise HTTPException(502, f"AI request failed: {e}")
+
+
+# =============================================================================
+# MARKET INTELLIGENCE  (live cross-asset snapshot + notable-move events)
+# =============================================================================
+_MI_INSTRUMENTS = {
+    "Dow Jones": ("^DJI", "Global", 1.5),
+    "S&P 500": ("^GSPC", "Global", 1.5),
+    "Nasdaq": ("^IXIC", "Global", 1.8),
+    "Nifty 50": ("^NSEI", "India", 1.2),
+    "Sensex": ("^BSESN", "India", 1.2),
+    "Bank Nifty": ("^NSEBANK", "India", 1.5),
+    "India VIX": ("^INDIAVIX", "India", 6.0),
+    "Crude Oil (WTI)": ("CL=F", "Commodities", 3.0),
+    "Gold": ("GC=F", "Commodities", 1.5),
+    "USD/INR": ("INR=X", "Currency", 0.5),
+}
+
+_MI_INSTRUMENT_MAP = {
+    "Crude Oil (WTI)": "Crude Oil", "USD/INR": "USD/INR", "Gold": "Gold",
+}
+
+# Ported directly from sector_sensitivity_data.py so both the website and
+# this app stay consistent - a rules-based qualitative framework, not a
+# computed regression.
+_MI_SECTOR_SENSITIVITY = {
+    "Crude Oil": {
+        "Energy": ("Positive", "High", "Oil & gas producer revenue is directly tied to crude price levels"),
+        "Industrials": ("Negative", "Medium", "Input and transport costs move with crude prices"),
+        "Consumer Cyclical": ("Negative", "Medium", "Airlines/autos have fuel costs tied to crude prices"),
+        "Basic Materials": ("Mixed", "Medium", "Chemicals/paints have crude-linked input costs; some producers are crude-linked revenue"),
+    },
+    "USD/INR": {
+        "Technology": ("Positive", "High", "IT services revenue is largely dollar-denominated"),
+        "Healthcare": ("Positive", "Medium", "Pharma exporters have significant dollar-denominated revenue"),
+        "Energy": ("Negative", "High", "Oil imports are priced in dollars, so rupee terms move with the exchange rate"),
+        "Consumer Cyclical": ("Negative", "Medium", "Companies with imported inputs have dollar-linked costs"),
+    },
+    "Gold": {
+        "Basic Materials": ("Positive", "Medium", "Gold miners/related materials companies have gold-linked revenue"),
+        "Consumer Cyclical": ("Mixed", "Low", "Jewellery retailers have gold-linked input costs, partly pass-through"),
+    },
+}
+
+
+def _mi_sensitivity_for_direction(instrument: str, direction: str) -> dict:
+    base = _MI_SECTOR_SENSITIVITY.get(instrument, {})
+    if direction == "up":
+        return base
+    flipped = {}
+    for sector, (dir_, conf, why) in base.items():
+        if dir_ == "Positive":
+            flipped[sector] = ("Negative", conf, why)
+        elif dir_ == "Negative":
+            flipped[sector] = ("Positive", conf, why)
+        else:
+            flipped[sector] = ("Mixed", conf, why)
+    return flipped
+
+
+def _m_compute_intelligence_snapshot() -> list[dict]:
+    symbols = [v[0] for v in _MI_INSTRUMENTS.values()]
+    data = _myf.download(symbols, period="5d", progress=False,
+                         auto_adjust=True, group_by="ticker", threads=True)
+
+    rows = []
+    for name, (sym, category, threshold) in _MI_INSTRUMENTS.items():
+        try:
+            closes = data[sym]["Close"].dropna() if len(symbols) > 1 else data["Close"].dropna()
+            if len(closes) < 2:
+                continue
+            latest, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
+            change_pct = (latest / prev - 1) * 100
+            notable = abs(change_pct) >= threshold
+            row = {
+                "instrument": name, "category": category, "value": round(latest, 2),
+                "change_pct": round(change_pct, 2), "threshold": threshold, "notable": notable,
+            }
+            if notable:
+                direction = "up" if change_pct >= 0 else "down"
+                row["direction"] = direction
+                row["magnitude"] = "sharply" if abs(change_pct) >= threshold * 1.5 else "notably"
+                sens_key = _MI_INSTRUMENT_MAP.get(name)
+                if sens_key:
+                    sector_map = _mi_sensitivity_for_direction(sens_key, direction)
+                    row["sector_impact"] = [
+                        {"sector": s, "direction": d, "confidence": c, "why": w}
+                        for s, (d, c, w) in sector_map.items()
+                    ]
+            rows.append(row)
+        except Exception:
+            continue
+    return rows
+
+
+@app.get("/market/intelligence/snapshot")
+def market_intelligence_snapshot():
+    try:
+        rows = _m_cached("market_intel_snapshot", 300, _m_compute_intelligence_snapshot)
+    except Exception as e:
+        raise HTTPException(503, f"Could not load market snapshot: {e}")
+    if not rows:
+        raise HTTPException(503, "No market data available right now")
+    return {"instruments": rows, "as_of": _now_ist_str()}
+
+
+class IntelWhyRequest(BaseModel):
+    instrument: str
+    change_pct: float
+    threshold: float
+
+
+@app.post("/market/intelligence/why")
+def market_intelligence_why(req: IntelWhyRequest):
+    import os
+    try:
+        from google import genai
+    except ImportError:
+        raise HTTPException(500, "google-genai not installed")
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise HTTPException(500, "GEMINI_API_KEY not set on the server")
+
+    prompt = f"""You are a market commentator explaining a price move. You do NOT have access to today's actual news \u2014 only the fact of the price move itself.
+
+{req.instrument} has moved {req.change_pct:+.2f}% recently.
+
+Write 2-3 sentences of PLAUSIBLE general context for why an instrument like this might move this much \u2014 general market dynamics, NOT a claim about specific news you don't have. Start by clearly stating this is general context, not confirmed news for today. Keep it under 60 words. Add no other disclaimer; the app adds one."""
+
+    try:
+        client = genai.Client(api_key=key)
+        resp = client.models.generate_content(model="gemini-flash-latest", contents=prompt)
+        return {"analysis": (resp.text or "").strip()}
+    except Exception as e:
+        raise HTTPException(502, f"AI request failed: {e}")
+
+
 # =============================================================================
 # LIVE CHART
 # =============================================================================
