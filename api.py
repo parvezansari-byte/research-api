@@ -1169,10 +1169,11 @@ def stock_detail(symbol: str):
 
 
 # ---------------------------------------------------------------------------
-# Research report PDF - composite score, fundamentals, AI analysis, risk
-# flags, and links (NSE filings + the Crescent website). Ported from the
-# website's research.py scoring/risk-flag rules so both platforms agree;
-# adds an AI Analysis section the website version doesn't have.
+# Research report PDF - matches the full website version: composite
+# score, fundamentals, analyst consensus, 3 financial trend tables,
+# dividends/splits, 5Y valuation-history proxy, risk flags, recent news,
+# links (Google search + NSE filings + the Crescent website), plus an
+# AI Analysis section the website version doesn't have.
 # ---------------------------------------------------------------------------
 def _rr_score(f: dict, sig: dict) -> dict:
     def pts(cond_list):
@@ -1266,14 +1267,184 @@ Rules: use ONLY the data above; invent no numbers or news. Never say whether to 
         return f"AI analysis could not be generated right now ({e})."
 
 
+def _rr_extract_rows(df, candidates):
+    """Pull whichever label variant is present for each metric (yfinance's
+    exact row names vary by version/company) into a clean, consistently
+    named trend table."""
+    import pandas as pd
+    if df is None or df.empty:
+        return pd.DataFrame()
+    rows = {}
+    for names, out_name in candidates:
+        for n in names:
+            if n in df.index:
+                rows[out_name] = df.loc[n]
+                break
+    return pd.DataFrame(rows).T if rows else pd.DataFrame()
+
+
+def _rr_financial_trend(stm: dict):
+    import pandas as pd
+    inc = stm.get("income", pd.DataFrame())
+    if inc.empty:
+        return pd.DataFrame()
+    wanted = [("Total Revenue", "Revenue (Rs cr)"), ("Net Income", "Net Profit (Rs cr)")]
+    rows = {}
+    for src_name, out_name in wanted:
+        if src_name in inc.index:
+            rows[out_name] = inc.loc[src_name]
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows).T
+    if "Revenue (Rs cr)" in out.index and "Net Profit (Rs cr)" in out.index:
+        margin = (out.loc["Net Profit (Rs cr)"] / out.loc["Revenue (Rs cr)"] * 100).round(1)
+        out.loc["Net Margin %"] = margin
+    return out
+
+
+def _rr_balance_sheet_trend(stm: dict):
+    import pandas as pd
+    bal = stm.get("balance", pd.DataFrame())
+    return _rr_extract_rows(bal, [
+        (["Total Assets"], "Total Assets (Rs cr)"),
+        (["Total Debt"], "Total Debt (Rs cr)"),
+        (["Stockholders Equity", "Total Equity Gross Minority Interest",
+          "Total Stockholder Equity"], "Total Equity (Rs cr)"),
+        (["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments",
+          "Cash Financial"], "Cash & Equivalents (Rs cr)"),
+    ])
+
+
+def _rr_cashflow_trend(stm: dict):
+    cf = stm.get("cashflow", None)
+    import pandas as pd
+    if cf is None:
+        cf = pd.DataFrame()
+    return _rr_extract_rows(cf, [
+        (["Operating Cash Flow", "Total Cash From Operating Activities",
+          "Cash Flow From Continuing Operating Activities"], "Operating CF (Rs cr)"),
+        (["Investing Cash Flow", "Total Cashflows From Investing Activities",
+          "Cash Flow From Continuing Investing Activities"], "Investing CF (Rs cr)"),
+        (["Financing Cash Flow", "Total Cash From Financing Activities",
+          "Cash Flow From Continuing Financing Activities"], "Financing CF (Rs cr)"),
+        (["Free Cash Flow"], "Free Cash Flow (Rs cr)"),
+    ])
+
+
+def _rr_analyst_consensus(sym: str, sig: dict) -> dict:
+    try:
+        from analysis_api import _yf_ticker
+        info = _yf_ticker(sym).info or {}
+        tgt = info.get("targetMeanPrice")
+        n_analysts = info.get("numberOfAnalystOpinions")
+        reco = (info.get("recommendationKey") or "\u2014").replace("_", " ").upper()
+        upside = None
+        if tgt and sig.get("close"):
+            upside = (tgt / sig["close"] - 1) * 100
+        return {"reco": reco, "target": tgt, "upside": upside, "n_analysts": n_analysts}
+    except Exception:
+        return {}
+
+
+def _rr_5y_range(sym: str) -> dict:
+    try:
+        from analysis_api import _yf_ticker
+        hist = _yf_ticker(sym).history(period="5y")
+        if hist.empty:
+            return {}
+        close = hist["Close"]
+        lo, hi, cur = float(close.min()), float(close.max()), float(close.iloc[-1])
+        pct = (cur - lo) / (hi - lo) * 100 if hi > lo else None
+        return {
+            "low_5y": round(lo, 2), "high_5y": round(hi, 2),
+            "percentile_5y": round(pct, 0) if pct is not None else None,
+        }
+    except Exception:
+        return {}
+
+
+def _rr_dividends_splits(sym: str) -> dict:
+    try:
+        from analysis_api import _yf_ticker
+        t = _yf_ticker(sym)
+        div = t.dividends
+        splits = t.splits
+        div_rows = ([(str(idx.date()), round(float(v), 2)) for idx, v in div.tail(8).items()]
+                    if div is not None and not div.empty else [])
+        split_rows = ([(str(idx.date()), str(v)) for idx, v in splits.tail(8).items()]
+                      if splits is not None and not splits.empty else [])
+        return {"dividends": div_rows, "splits": split_rows}
+    except Exception:
+        return {"dividends": [], "splits": []}
+
+
+def _rr_stock_news(company: str, sym_root: str) -> list[dict]:
+    """Recent headlines mentioning this stock, from the same free RSS
+    feeds used elsewhere in this API - no separate news API/key needed.
+    feedparser.parse() has NO timeout by default and can hang
+    indefinitely on a slow/unresponsive feed, so this wraps every fetch
+    in a short socket timeout and gives up on the whole news section
+    once a small overall time budget is used up, rather than ever
+    blocking the full PDF for minutes over a "nice to have" section."""
+    import re
+    import socket
+    import time
+    import feedparser
+
+    feeds = {
+        "Economic Times Markets": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+        "ET Stocks": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms",
+        "Moneycontrol Markets": "https://www.moneycontrol.com/rss/marketreports.xml",
+        "Moneycontrol Business": "https://www.moneycontrol.com/rss/business.xml",
+        "Livemint Markets": "https://www.livemint.com/rss/markets",
+        "Business Standard Markets": "https://www.business-standard.com/rss/markets-106.rss",
+    }
+
+    keywords = {sym_root.lower()}
+    for word in re.split(r"[^A-Za-z]+", company or ""):
+        if len(word) > 3 and word.lower() not in ("ltd", "limited", "the", "and", "company"):
+            keywords.add(word.lower())
+
+    out = []
+    start = time.time()
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(4)  # seconds per feed - feedparser has no timeout param
+    try:
+        for source, url in feeds.items():
+            if time.time() - start > 12:
+                break
+            try:
+                feed = feedparser.parse(url)
+            except Exception:
+                continue
+            for e in feed.entries[:30]:
+                title = getattr(e, "title", "") or ""
+                summary = re.sub(r"<[^>]+>", " ", getattr(e, "summary", "") or "")
+                blob = f"{title} {summary}".lower()
+                if any(kw in blob for kw in keywords):
+                    out.append({
+                        "source": source,
+                        "title": title.strip(),
+                        "link": getattr(e, "link", ""),
+                        "published": getattr(e, "published", ""),
+                    })
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+    return out[:8]
+
+
 @app.get("/stock/{symbol}/research-pdf")
 def stock_research_pdf(symbol: str):
-    """A downloadable PDF research report: composite score, fundamentals,
-    AI-generated analysis, risk flags, and links to NSE filings and the
-    Crescent website's Research Reports page."""
-    from analysis_api import get_fundamentals, get_technicals
+    """A downloadable PDF research report matching the full website
+    version: composite score, fundamentals, analyst consensus, financial
+    trend tables, dividends/splits, 5Y valuation context, AI-generated
+    analysis, risk flags, recent news, and links (Google search + NSE
+    filings + the Crescent website)."""
+    from analysis_api import get_fundamentals, get_technicals, get_statements
     from datetime import datetime
+    from urllib.parse import quote_plus
     from fpdf import FPDF
+    import pandas as pd
 
     pick = symbol.upper().replace(".NS", "")
     sym = f"{pick}.NS"
@@ -1296,10 +1467,26 @@ def stock_research_pdf(symbol: str):
     flags = _rr_risk_flags(f, sig)
     ai_text = _rr_ai_analysis(name, f, sig)
 
+    try:
+        stm = get_statements(sym)
+    except Exception:
+        stm = {}
+    trend = _rr_financial_trend(stm)
+    bal_trend = _rr_balance_sheet_trend(stm)
+    cf_trend = _rr_cashflow_trend(stm)
+    consensus = _rr_analyst_consensus(sym, sig)
+    r5 = _rr_5y_range(sym)
+    div_data = _rr_dividends_splits(sym)
+    try:
+        news_items = _rr_stock_news(name, pick)
+    except Exception:
+        news_items = []
+
     def tx(x):
         return str(x).replace("\u20b9", "Rs ").encode("latin-1", "replace").decode("latin-1")
 
     ACCENT_CYAN = (6, 182, 212)
+    ACCENT_EMERALD = (16, 185, 129)
     HEADER_BG = (8, 28, 38)
     VERDICT_COLORS = {
         "STRONG": (16, 185, 129), "POSITIVE": (52, 199, 130),
@@ -1335,7 +1522,8 @@ def stock_research_pdf(symbol: str):
             self.set_font("Helvetica", "I", 7)
             self.set_text_color(130, 130, 130)
             self.set_y(-12)
-            self.cell(0, 6, tx("Generated by Advantage  |  For education only, not investment advice"), align="C")
+            self.cell(0, 6, tx(f"Page {self.page_no()}  |  Generated by Advantage  |  "
+                               f"For education only, not investment advice"), align="C")
 
     def _section(pdf, title, rgb=ACCENT_CYAN):
         pdf.set_fill_color(*rgb)
@@ -1346,6 +1534,30 @@ def stock_research_pdf(symbol: str):
         pdf.cell(0, 7, tx(title), ln=1)
         pdf.set_x(10)
         pdf.ln(1)
+
+    def _render_trend_table(pdf, title, df, tint_rgb):
+        if df.empty:
+            return
+        _section(pdf, title, tint_rgb)
+        cols = [""] + [str(c) for c in df.columns]
+        w = (pdf.w - pdf.l_margin - pdf.r_margin) / len(cols)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_fill_color(*HEADER_BG)
+        pdf.set_text_color(255, 255, 255)
+        for c in cols:
+            pdf.cell(w, 7, tx(c)[:18], fill=True)
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 9)
+        for i, (idx, row) in enumerate(df.iterrows()):
+            fill_rgb = _tint(tint_rgb, 0.92) if i % 2 == 0 else (255, 255, 255)
+            pdf.set_fill_color(*fill_rgb)
+            pdf.set_text_color(30, 30, 30)
+            pdf.cell(w, 6.5, tx(idx)[:18], fill=True)
+            for v in row:
+                cell_txt = f"{v:,.0f}" if isinstance(v, (int, float)) and pd.notna(v) else "\u2014"
+                pdf.cell(w, 6.5, tx(cell_txt)[:18], fill=True)
+            pdf.ln()
+        pdf.ln(4)
 
     pdf = StyledPDF()
     pdf.set_auto_page_break(auto=True, margin=20)
@@ -1367,6 +1579,19 @@ def stock_research_pdf(symbol: str):
     pdf.set_text_color(60, 60, 60)
     pdf.cell(0, 6, tx(f"Valuation {sc['val']}   |   Quality {sc['qual']}   |   Momentum {sc['mom']}"))
     pdf.set_y(card_y + 24)
+
+    # ---- Analyst consensus ----
+    if consensus:
+        _section(pdf, "Analyst Consensus (Yahoo Finance)", ACCENT_EMERALD)
+        pdf.set_font("Helvetica", "", 9.5)
+        pdf.set_text_color(50, 50, 50)
+        tgt_txt = f"Rs {consensus['target']:,.0f}" if consensus.get("target") else "\u2014"
+        up_txt = f"{consensus['upside']:+.1f}%" if consensus.get("upside") is not None else "\u2014"
+        pdf.multi_cell(0, 5.5, tx(
+            f"Consensus rating: {consensus.get('reco', '\u2014')}   |   Mean target: {tgt_txt}   |   "
+            f"Implied upside: {up_txt}   |   Analysts covering: {consensus.get('n_analysts') or '\u2014'}"
+        ))
+        pdf.ln(3)
 
     # ---- Fundamentals ----
     _section(pdf, "Fundamentals")
@@ -1392,25 +1617,44 @@ def stock_research_pdf(symbol: str):
         pdf.cell(0, 6.5, tx(value if value is not None else "\u2014"), fill=True, ln=1)
     pdf.ln(4)
 
-    # ---- AI Analysis ----
-    _section(pdf, "AI Analysis")
-    pdf.set_font("Helvetica", "", 9.5)
-    pdf.set_text_color(40, 40, 40)
-    for para in ai_text.split("\n"):
-        if not para.strip():
-            continue
-        pdf.set_x(10)
-        pdf.multi_cell(pdf.w - 20, 5.3, tx(para.strip()))
-        pdf.ln(1)
-    pdf.set_font("Helvetica", "I", 7.5)
-    pdf.set_text_color(140, 140, 140)
-    pdf.set_x(10)
-    pdf.cell(0, 5, tx("AI-generated from the data above - not verified research, not financial advice."), ln=1)
-    pdf.ln(3)
+    # ---- 5Y valuation context ----
+    if r5.get("percentile_5y") is not None:
+        _section(pdf, "Valuation Context (5Y Price Range)", ACCENT_EMERALD)
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(50, 50, 50)
+        band = ("Near 5Y lows" if r5["percentile_5y"] < 25 else
+                "Near 5Y highs" if r5["percentile_5y"] > 75 else "Mid-range")
+        pdf.multi_cell(0, 5.5, tx(
+            f"5Y Low -> High: Rs {r5['low_5y']:,.0f} -> Rs {r5['high_5y']:,.0f}   |   "
+            f"Current percentile: {r5['percentile_5y']:.0f}th ({band})"
+        ))
+        pdf.ln(3)
+
+    # ---- Financial trend tables ----
+    _render_trend_table(pdf, "Revenue & Profit Trend (Rs crore)", trend, ACCENT_EMERALD)
+    _render_trend_table(pdf, "Balance Sheet Trend (Rs crore)", bal_trend, ACCENT_CYAN)
+    _render_trend_table(pdf, "Cash Flow Trend (Rs crore)", cf_trend, ACCENT_EMERALD)
+
+    # ---- Dividends & splits ----
+    if div_data["dividends"] or div_data["splits"]:
+        _section(pdf, "Dividend & Corporate Actions")
+        pdf.set_font("Helvetica", "", 9)
+        if div_data["dividends"]:
+            pdf.set_text_color(30, 30, 30)
+            pdf.cell(0, 6, tx("Recent dividends (per share):"), ln=1)
+            for date, amt in div_data["dividends"]:
+                pdf.cell(0, 5.5, tx(f"  {date}: Rs {amt}"), ln=1)
+            pdf.ln(2)
+        if div_data["splits"]:
+            pdf.cell(0, 6, tx("Recent splits / bonuses:"), ln=1)
+            for date, ratio in div_data["splits"]:
+                pdf.cell(0, 5.5, tx(f"  {date}: {ratio}"), ln=1)
+            pdf.ln(2)
+        pdf.ln(2)
 
     # ---- Risk Flags ----
     has_real_flags = not (len(flags) == 1 and "No major red flags" in flags[0])
-    flag_rgb = (239, 68, 68) if has_real_flags else (16, 185, 129)
+    flag_rgb = (239, 68, 68) if has_real_flags else ACCENT_EMERALD
     _section(pdf, "Risk Flags", flag_rgb)
     card_y = pdf.get_y()
     pdf.set_font("Helvetica", "", 9.5)
@@ -1427,17 +1671,61 @@ def stock_research_pdf(symbol: str):
         pdf.multi_cell(pdf.w - 30, 5.5, tx(f"-  {flag}"))
     pdf.set_y(card_y + box_h + 4)
 
-    # ---- Links ----
-    _section(pdf, "Links")
-    pdf.set_font("Helvetica", "U", 9.5)
+    # ---- AI Analysis ----
+    _section(pdf, "AI Analysis")
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.set_text_color(40, 40, 40)
+    for para in ai_text.split("\n"):
+        if not para.strip():
+            continue
+        pdf.set_x(10)
+        pdf.multi_cell(pdf.w - 20, 5.3, tx(para.strip()))
+        pdf.ln(1)
+    pdf.set_font("Helvetica", "I", 7.5)
+    pdf.set_text_color(140, 140, 140)
+    pdf.set_x(10)
+    pdf.cell(0, 5, tx("AI-generated from the data above - not verified research, not financial advice."), ln=1)
+    pdf.ln(3)
+
+    # ---- Recent news ----
+    if news_items:
+        _section(pdf, "Recent News")
+        pdf.set_font("Helvetica", "", 9)
+        for n in news_items:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(20, 20, 20)
+            pdf.set_x(10)
+            pdf.multi_cell(pdf.w - 20, 5.3, tx(n["title"]),
+                          link=n.get("link") or "")
+            pdf.set_font("Helvetica", "", 7.5)
+            pdf.set_text_color(120, 120, 120)
+            pdf.set_x(10)
+            pub = f"  |  {n['published']}" if n.get("published") else ""
+            pdf.cell(0, 4.5, tx(f"{n['source']}{pub}"), ln=1)
+            pdf.ln(1)
+        pdf.ln(2)
+
+    # ---- Links (Google search + NSE + Crescent site) ----
+    _section(pdf, "Full Annual Report & Filings / Links")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(50, 50, 50)
+    pdf.multi_cell(0, 5.5, tx(
+        "Figures above come from Yahoo Finance's structured data. For the "
+        "complete official document, and to view this stock on our own "
+        "platform, see:"
+    ))
     pdf.set_text_color(*ACCENT_CYAN)
+    pdf.set_font("Helvetica", "U", 9)
+    google_q = quote_plus(f"{name} annual report pdf")
+    pdf.cell(0, 6, tx("Search official annual report (Google)"), ln=1,
+             link=f"https://www.google.com/search?q={google_q}")
     pdf.cell(0, 6, tx("NSE company filings page"), ln=1,
              link=f"https://www.nseindia.com/get-quotes/equity?symbol={pick}")
     pdf.cell(0, 6, tx("View on the Crescent website"), ln=1,
              link="https://thecrescent.streamlit.app")
-    pdf.set_font("Helvetica", "", 8)
+    pdf.set_font("Helvetica", "", 7.5)
     pdf.set_text_color(120, 120, 120)
-    pdf.multi_cell(pdf.w - 20, 4.5, tx(
+    pdf.multi_cell(pdf.w - 20, 4.2, tx(
         "(The Crescent link opens the Research Reports page generally - "
         "the site doesn't yet support opening directly to a specific stock via link.)"
     ))
