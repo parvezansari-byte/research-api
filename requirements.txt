@@ -13,3 +13,5 @@ lxml
 html5lib
 beautifulsoup4
 curl_cffi
+fpdf2
+fpdf2

@@ -25,7 +25,7 @@ Render / Railway both work. Start command:
 from typing import Optional
 import math
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -1166,6 +1166,305 @@ def stock_detail(symbol: str):
 
     return _clean({"symbol": sym, "fundamentals": fundamentals,
                    "technicals": signals})
+
+
+# ---------------------------------------------------------------------------
+# Research report PDF - composite score, fundamentals, AI analysis, risk
+# flags, and links (NSE filings + the Crescent website). Ported from the
+# website's research.py scoring/risk-flag rules so both platforms agree;
+# adds an AI Analysis section the website version doesn't have.
+# ---------------------------------------------------------------------------
+def _rr_score(f: dict, sig: dict) -> dict:
+    def pts(cond_list):
+        earned = sum(w for ok, w in cond_list if ok is True)
+        possible = sum(w for ok, w in cond_list if ok is not None)
+        return earned, possible
+
+    val = pts([
+        (None if f.get("pe") is None else f["pe"] < 25, 2),
+        (None if f.get("pb") is None else f["pb"] < 4, 1),
+        (None if f.get("ev_ebitda") is None else f["ev_ebitda"] < 15, 1),
+    ])
+    qual = pts([
+        (None if f.get("roe_pct") is None else f["roe_pct"] > 15, 2),
+        (None if f.get("net_margin_pct") is None else f["net_margin_pct"] > 10, 1),
+        (None if f.get("debt_to_equity") is None else f["debt_to_equity"] < 1, 1),
+    ])
+    mom = pts([
+        (sig.get("trend") == "Uptrend", 1),
+        ((sig.get("ma_signal") or "").startswith("Golden"), 1),
+        (None if sig.get("ret_1y_pct") is None else sig["ret_1y_pct"] > 0, 1),
+        (30 <= (sig.get("rsi") or 50) <= 70, 1),
+    ])
+
+    earned = val[0] + qual[0] + mom[0]
+    possible = max(1, val[1] + qual[1] + mom[1])
+    score10 = round(earned / possible * 10, 1)
+    verdict = ("STRONG" if score10 >= 7.5 else
+               "POSITIVE" if score10 >= 6 else
+               "NEUTRAL" if score10 >= 4 else "WEAK")
+    return {
+        "score": score10, "verdict": verdict,
+        "val": f"{val[0]}/{val[1]}", "qual": f"{qual[0]}/{qual[1]}",
+        "mom": f"{mom[0]}/{mom[1]}",
+    }
+
+
+def _rr_risk_flags(f: dict, sig: dict) -> list[str]:
+    flags = []
+    if f.get("pe") and f["pe"] > 40:
+        flags.append(f"Rich valuation - PE of {f['pe']} is well above typical market levels")
+    if f.get("debt_to_equity") and f["debt_to_equity"] > 1.5:
+        flags.append(f"High leverage - debt/equity of {f['debt_to_equity']}")
+    if f.get("revenue_growth_pct") is not None and f["revenue_growth_pct"] < 0:
+        flags.append(f"Shrinking revenue - {f['revenue_growth_pct']}% growth")
+    if f.get("net_margin_pct") is not None and f["net_margin_pct"] < 5:
+        flags.append(f"Thin margins - net margin {f['net_margin_pct']}%")
+    if (sig.get("volatility_pct") or 0) > 40:
+        flags.append(f"High volatility - {sig['volatility_pct']}% annualised")
+    if sig.get("trend") == "Downtrend":
+        flags.append("Price below its 200-day moving average (downtrend)")
+    if not flags:
+        flags.append("No major red flags on the screened metrics")
+    return flags
+
+
+def _rr_ai_analysis(name: str, f: dict, sig: dict) -> str:
+    import os
+    from google import genai
+
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return ("AI analysis unavailable - GEMINI_API_KEY not set on the "
+                "server.")
+
+    facts = {**f, **sig}
+    fact_lines = "\n".join(
+        f"- {k}: {v}" for k, v in facts.items()
+        if v not in (None, "", 0) and not k.startswith("_")
+    )
+    prompt = f"""You are a financial research assistant for a retail investor in India. You are NOT giving buy/sell advice.
+
+Factual data for {name}:
+{fact_lines}
+
+Write a plain-English analysis with these sections, as plain text paragraphs (no markdown, no asterisks, no bullet symbols - just short paragraphs with a one-line heading in capital letters before each):
+
+OVERVIEW - what this stock is, in 1-2 sentences.
+RECENT PERFORMANCE - what the figures above suggest.
+STRENGTHS - 2-3 positives supported by the data, as a single paragraph.
+RISKS AND THINGS TO WATCH - 2-3 honest risks, as a single paragraph; be balanced.
+
+Rules: use ONLY the data above; invent no numbers or news. Never say whether to buy, sell, or hold. Under 260 words total."""
+
+    try:
+        client = genai.Client(api_key=key)
+        resp = client.models.generate_content(
+            model="gemini-flash-latest", contents=prompt)
+        return (resp.text or "").strip()
+    except Exception as e:
+        return f"AI analysis could not be generated right now ({e})."
+
+
+@app.get("/stock/{symbol}/research-pdf")
+def stock_research_pdf(symbol: str):
+    """A downloadable PDF research report: composite score, fundamentals,
+    AI-generated analysis, risk flags, and links to NSE filings and the
+    Crescent website's Research Reports page."""
+    from analysis_api import get_fundamentals, get_technicals
+    from datetime import datetime
+    from fpdf import FPDF
+
+    pick = symbol.upper().replace(".NS", "")
+    sym = f"{pick}.NS"
+
+    try:
+        f = get_fundamentals(sym)
+        _, sig = get_technicals(sym)
+    except Exception as e:
+        raise HTTPException(502, f"Data source error: {e}")
+    if not sig:
+        raise HTTPException(404, f"No price data for '{symbol}'")
+    if f.get("_fetch_failed"):
+        raise HTTPException(
+            503, f"Fundamental data for '{symbol}' is temporarily unavailable "
+                 "- the data source is rate-limiting this server. Try again shortly."
+        )
+
+    name = str(f.get("name") or pick)
+    sc = _rr_score(f, sig)
+    flags = _rr_risk_flags(f, sig)
+    ai_text = _rr_ai_analysis(name, f, sig)
+
+    def tx(x):
+        return str(x).replace("\u20b9", "Rs ").encode("latin-1", "replace").decode("latin-1")
+
+    ACCENT_CYAN = (6, 182, 212)
+    HEADER_BG = (8, 28, 38)
+    VERDICT_COLORS = {
+        "STRONG": (16, 185, 129), "POSITIVE": (52, 199, 130),
+        "NEUTRAL": (245, 158, 11), "WEAK": (239, 68, 68),
+    }
+
+    def _tint(rgb, factor=0.85):
+        r, g, b = rgb
+        return (int(r + (255 - r) * factor), int(g + (255 - g) * factor),
+                int(b + (255 - b) * factor))
+
+    class StyledPDF(FPDF):
+        def header(self):
+            self.set_fill_color(*HEADER_BG)
+            self.rect(0, 0, self.w, 24, style="F")
+            self.set_xy(10, 6)
+            self.set_font("Helvetica", "B", 15)
+            self.set_text_color(*ACCENT_CYAN)
+            self.cell(0, 8, tx(f"Research Report: {name}"), ln=1)
+            self.set_x(10)
+            self.set_font("Helvetica", "", 8)
+            self.set_text_color(200, 220, 225)
+            price_txt = f"Rs {sig['close']:,.2f}" if sig.get("close") is not None else "Rs N/A"
+            self.cell(0, 5, tx(f"{f.get('sector') or '\u2014'}   |   Price {price_txt}   |   "
+                               f"{datetime.now().strftime('%d %b %Y')}"))
+            self.set_y(30)
+            self.set_text_color(20, 20, 20)
+
+        def footer(self):
+            self.set_draw_color(*ACCENT_CYAN)
+            self.set_line_width(0.6)
+            self.line(10, self.h - 15, self.w - 10, self.h - 15)
+            self.set_font("Helvetica", "I", 7)
+            self.set_text_color(130, 130, 130)
+            self.set_y(-12)
+            self.cell(0, 6, tx("Generated by Advantage  |  For education only, not investment advice"), align="C")
+
+    def _section(pdf, title, rgb=ACCENT_CYAN):
+        pdf.set_fill_color(*rgb)
+        pdf.rect(10, pdf.get_y(), 3.5, 7, style="F")
+        pdf.set_xy(16, pdf.get_y())
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(20, 20, 20)
+        pdf.cell(0, 7, tx(title), ln=1)
+        pdf.set_x(10)
+        pdf.ln(1)
+
+    pdf = StyledPDF()
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.add_page()
+
+    # ---- Composite score card ----
+    verdict_rgb = VERDICT_COLORS.get(sc["verdict"], (150, 150, 150))
+    card_y = pdf.get_y()
+    pdf.set_fill_color(*_tint(verdict_rgb, 0.88))
+    pdf.set_draw_color(*verdict_rgb)
+    pdf.set_line_width(0.4)
+    pdf.rect(10, card_y, pdf.w - 20, 20, style="DF")
+    pdf.set_xy(15, card_y + 4)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(*verdict_rgb)
+    pdf.cell(0, 7, tx(f"Composite Score: {sc['score']}/10  -  {sc['verdict']}"), ln=1)
+    pdf.set_x(15)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(60, 60, 60)
+    pdf.cell(0, 6, tx(f"Valuation {sc['val']}   |   Quality {sc['qual']}   |   Momentum {sc['mom']}"))
+    pdf.set_y(card_y + 24)
+
+    # ---- Fundamentals ----
+    _section(pdf, "Fundamentals")
+    snap = [
+        ("PE", f.get("pe")), ("PB", f.get("pb")), ("EV/EBITDA", f.get("ev_ebitda")),
+        ("ROE %", f.get("roe_pct")), ("Net Margin %", f.get("net_margin_pct")),
+        ("Debt/Equity", f.get("debt_to_equity")),
+        ("Dividend Yield %", f.get("dividend_yield_pct")),
+        ("Revenue Growth %", f.get("revenue_growth_pct")),
+        ("Free Cashflow Rs cr", f.get("free_cashflow_cr")),
+    ]
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(*HEADER_BG)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(70, 7, tx("Metric"), fill=True)
+    pdf.cell(0, 7, tx("Value"), fill=True, ln=1)
+    pdf.set_font("Helvetica", "", 10)
+    for i, (label, value) in enumerate(snap):
+        fill_rgb = _tint(ACCENT_CYAN, 0.92) if i % 2 == 0 else (255, 255, 255)
+        pdf.set_fill_color(*fill_rgb)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(70, 6.5, tx(label), fill=True)
+        pdf.cell(0, 6.5, tx(value if value is not None else "\u2014"), fill=True, ln=1)
+    pdf.ln(4)
+
+    # ---- AI Analysis ----
+    _section(pdf, "AI Analysis")
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.set_text_color(40, 40, 40)
+    for para in ai_text.split("\n"):
+        if not para.strip():
+            continue
+        pdf.set_x(10)
+        pdf.multi_cell(pdf.w - 20, 5.3, tx(para.strip()))
+        pdf.ln(1)
+    pdf.set_font("Helvetica", "I", 7.5)
+    pdf.set_text_color(140, 140, 140)
+    pdf.set_x(10)
+    pdf.cell(0, 5, tx("AI-generated from the data above - not verified research, not financial advice."), ln=1)
+    pdf.ln(3)
+
+    # ---- Risk Flags ----
+    has_real_flags = not (len(flags) == 1 and "No major red flags" in flags[0])
+    flag_rgb = (239, 68, 68) if has_real_flags else (16, 185, 129)
+    _section(pdf, "Risk Flags", flag_rgb)
+    card_y = pdf.get_y()
+    pdf.set_font("Helvetica", "", 9.5)
+    est_lines = sum(max(1, len(flag) // 100 + 1) for flag in flags)
+    box_h = est_lines * 5.5 + 8
+    pdf.set_fill_color(*_tint(flag_rgb, 0.9))
+    pdf.set_draw_color(*flag_rgb)
+    pdf.set_line_width(0.3)
+    pdf.rect(10, card_y, pdf.w - 20, box_h, style="DF")
+    pdf.set_xy(15, card_y + 4)
+    pdf.set_text_color(50, 50, 50)
+    for flag in flags:
+        pdf.set_x(15)
+        pdf.multi_cell(pdf.w - 30, 5.5, tx(f"-  {flag}"))
+    pdf.set_y(card_y + box_h + 4)
+
+    # ---- Links ----
+    _section(pdf, "Links")
+    pdf.set_font("Helvetica", "U", 9.5)
+    pdf.set_text_color(*ACCENT_CYAN)
+    pdf.cell(0, 6, tx("NSE company filings page"), ln=1,
+             link=f"https://www.nseindia.com/get-quotes/equity?symbol={pick}")
+    pdf.cell(0, 6, tx("View on the Crescent website"), ln=1,
+             link="https://thecrescent.streamlit.app")
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.multi_cell(pdf.w - 20, 4.5, tx(
+        "(The Crescent link opens the Research Reports page generally - "
+        "the site doesn't yet support opening directly to a specific stock via link.)"
+    ))
+    pdf.ln(3)
+
+    # ---- Disclaimer ----
+    pdf.set_fill_color(255, 251, 235)
+    pdf.set_draw_color(245, 200, 120)
+    disc_y = pdf.get_y()
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_xy(15, disc_y + 3)
+    pdf.set_text_color(110, 90, 30)
+    pdf.multi_cell(pdf.w - 30, 4.5, tx(
+        "Disclaimer: Generated from public market data using transparent rules "
+        "plus an AI-generated analysis section. For education only - not "
+        "investment advice."
+    ))
+    disc_h = pdf.get_y() - disc_y + 3
+    pdf.rect(10, disc_y, pdf.w - 20, disc_h, style="D")
+
+    pdf_bytes = bytes(pdf.output())
+    filename = f"research_{pick}_{datetime.now().strftime('%Y%m%d')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/stock/{symbol}/history")
