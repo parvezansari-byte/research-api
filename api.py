@@ -1433,6 +1433,64 @@ def _rr_stock_news(company: str, sym_root: str) -> list[dict]:
     return out[:8]
 
 
+@app.get("/stock/{symbol}/research-summary")
+def stock_research_summary(symbol: str):
+    """Fast JSON preview of the research report - score, consensus,
+    fundamentals, 5Y range, risk flags, and links - for inline display in
+    the app before committing to the full PDF (which also adds trend
+    tables, dividends, recent news, and the AI analysis). Reuses the same
+    scoring/consensus/risk-flag functions the PDF endpoint uses, so the
+    two never drift apart."""
+    from analysis_api import get_fundamentals, get_technicals
+    from urllib.parse import quote_plus
+
+    pick = symbol.upper().replace(".NS", "")
+    sym = f"{pick}.NS"
+
+    try:
+        f = get_fundamentals(sym)
+        _, sig = get_technicals(sym)
+    except Exception as e:
+        raise HTTPException(502, f"Data source error: {e}")
+    if not sig:
+        raise HTTPException(404, f"No price data for '{symbol}'")
+    if f.get("_fetch_failed"):
+        raise HTTPException(
+            503, f"Fundamental data for '{symbol}' is temporarily unavailable "
+                 "- the data source is rate-limiting this server. Try again shortly."
+        )
+
+    name = str(f.get("name") or pick)
+    sc = _rr_score(f, sig)
+    flags = _rr_risk_flags(f, sig)
+    consensus = _rr_analyst_consensus(sym, sig)
+    r5 = _rr_5y_range(sym)
+
+    google_q = quote_plus(f"{name} annual report pdf")
+    links = {
+        "annual_report_search": f"https://www.google.com/search?q={google_q}",
+        "nse_filings": f"https://www.nseindia.com/get-quotes/equity?symbol={pick}",
+        "crescent_site": "https://thecrescent.streamlit.app",
+    }
+
+    return _clean({
+        "symbol": sym, "name": name, "sector": f.get("sector"),
+        "price": sig.get("close"), "market_cap_cr": f.get("market_cap_cr"),
+        "score": sc, "risk_flags": flags,
+        "consensus": consensus if (consensus.get("target") or consensus.get("n_analysts")) else None,
+        "range_5y": r5 if r5.get("percentile_5y") is not None else None,
+        "fundamentals": {
+            "pe": f.get("pe"), "pb": f.get("pb"), "ev_ebitda": f.get("ev_ebitda"),
+            "roe_pct": f.get("roe_pct"), "net_margin_pct": f.get("net_margin_pct"),
+            "debt_to_equity": f.get("debt_to_equity"),
+            "dividend_yield_pct": f.get("dividend_yield_pct"),
+            "revenue_growth_pct": f.get("revenue_growth_pct"),
+            "free_cashflow_cr": f.get("free_cashflow_cr"),
+        },
+        "links": links,
+    })
+
+
 @app.get("/stock/{symbol}/research-pdf")
 def stock_research_pdf(symbol: str):
     """A downloadable PDF research report matching the full website
