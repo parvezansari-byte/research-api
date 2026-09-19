@@ -2297,6 +2297,334 @@ def signup(req: AuthRequest):
 
 
 # ===========================================================================
+# FINANCE TRACKER  (expenses, categories, loans, pending dues - per user,
+# same Supabase project as auth/holdings. This backend never existed until
+# now - the Flutter app's Finance Tracker screen was built expecting these
+# exact endpoints, but they were never implemented, hence the 404s.)
+# ===========================================================================
+_DEFAULT_CATEGORIES = [
+    "Food & Dining", "Groceries", "Transport", "Shopping",
+    "Bills & Utilities", "Rent", "Entertainment", "Healthcare",
+    "Education", "Travel", "Insurance", "Investments", "Other",
+]
+
+
+def _emi(principal: float, annual_rate: float, months: int) -> float:
+    """Standard reducing-balance EMI formula."""
+    if months <= 0:
+        return 0.0
+    r = annual_rate / 12 / 100
+    if r == 0:
+        return round(principal / months, 2)
+    factor = (1 + r) ** months
+    return round(principal * r * factor / (factor - 1), 2)
+
+
+def _next_month_str(month: str) -> str:
+    """'2026-09' -> '2026-10-01' (handles year rollover); used as an
+    exclusive upper bound when filtering a month's expenses."""
+    y, m = month.split("-")
+    y, m = int(y), int(m)
+    if m == 12:
+        y, m = y + 1, 1
+    else:
+        m += 1
+    return f"{y:04d}-{m:02d}-01"
+
+
+
+# ---- Expenses ----
+class ExpenseRequest(BaseModel):
+    amount: float
+    category: str
+    description: Optional[str] = None
+    expense_date: str  # 'YYYY-MM-DD'
+
+
+@app.get("/expenses/{email}")
+def get_expenses(email: str, month: Optional[str] = None):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        q = sb.table("expenses").select("*").eq("user_email", email)
+        if month:
+            q = q.gte("expense_date", f"{month}-01").lt(
+                "expense_date", _next_month_str(month))
+        res = q.order("expense_date", desc=True).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"expenses": res.data or []}
+
+
+@app.post("/expenses/{email}")
+def add_expense(email: str, req: ExpenseRequest):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        sb.table("expenses").insert({
+            "user_email": email,
+            "amount": req.amount,
+            "category": req.category,
+            "description": req.description,
+            "expense_date": req.expense_date,
+        }).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"ok": True}
+
+
+@app.delete("/expenses/{email}/{expense_id}")
+def delete_expense(email: str, expense_id: int):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        sb.table("expenses").delete().eq("id", expense_id).eq(
+            "user_email", email).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"ok": True}
+
+
+@app.get("/expenses/{email}/summary")
+def get_expense_summary(email: str, month: Optional[str] = None):
+    """Category + daily breakdown for a month, or all-time if month is None."""
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        q = sb.table("expenses").select("*").eq("user_email", email)
+        if month:
+            q = q.gte("expense_date", f"{month}-01").lt(
+                "expense_date", _next_month_str(month))
+        res = q.execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+
+    rows = res.data or []
+    total = sum(float(r.get("amount") or 0) for r in rows)
+
+    by_cat: dict = {}
+    by_day: dict = {}
+    for r in rows:
+        cat = r.get("category") or "Other"
+        amt = float(r.get("amount") or 0)
+        by_cat[cat] = by_cat.get(cat, 0) + amt
+        day = str(r.get("expense_date"))
+        by_day[day] = by_day.get(day, 0) + amt
+
+    return _clean({
+        "total": round(total, 2),
+        "month": month,
+        "by_category": [{"category": k, "amount": round(v, 2)}
+                        for k, v in sorted(by_cat.items(), key=lambda x: -x[1])],
+        "by_day": [{"date": k, "amount": round(v, 2)}
+                   for k, v in sorted(by_day.items())],
+    })
+
+
+# ---- Categories ----
+class CategoryRequest(BaseModel):
+    category_name: str
+
+
+@app.get("/categories/{email}")
+def get_categories(email: str):
+    """Merged list: hardcoded defaults + this user's custom categories."""
+    sb = _supabase()
+    custom = []
+    if sb is not None:
+        try:
+            res = sb.table("user_categories").select("category_name").eq(
+                "user_email", email.strip().lower()).execute()
+            custom = [r["category_name"] for r in (res.data or [])]
+        except Exception:
+            pass
+    merged = list(_DEFAULT_CATEGORIES)
+    for c in custom:
+        if c not in merged:
+            merged.append(c)
+    return {"categories": merged}
+
+
+@app.post("/categories/{email}")
+def add_category(email: str, req: CategoryRequest):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    name = req.category_name.strip()
+    if not name:
+        raise HTTPException(400, "Category name can't be empty")
+    try:
+        existing = sb.table("user_categories").select("id").eq(
+            "user_email", email).eq("category_name", name).execute()
+        if not existing.data:
+            sb.table("user_categories").insert({
+                "user_email": email, "category_name": name,
+            }).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"ok": True}
+
+
+# ---- Loans ----
+class LoanRequest(BaseModel):
+    loan_name: str
+    loan_type: str = "PERSONAL"
+    principal: float
+    annual_interest_rate: float
+    tenure_months: int
+    start_date: str
+
+
+@app.get("/loans/{email}")
+def get_loans(email: str):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        res = sb.table("loans").select("*").eq("user_email", email).order(
+            "created_at", desc=True).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+
+    rows = res.data or []
+    total_debt = 0.0
+    total_emi = 0.0
+    for r in rows:
+        principal = float(r.get("principal") or 0)
+        rate = float(r.get("annual_interest_rate") or 0)
+        months = int(r.get("tenure_months") or 0)
+        emi = _emi(principal, rate, months)
+        r["monthly_emi"] = emi
+        total_debt += principal
+        total_emi += emi
+
+    return _clean({
+        "loans": rows,
+        "total_outstanding_debt": round(total_debt, 2),
+        "total_monthly_emi": round(total_emi, 2),
+    })
+
+
+@app.post("/loans/{email}")
+def add_loan(email: str, req: LoanRequest):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        sb.table("loans").insert({
+            "user_email": email,
+            "loan_name": req.loan_name,
+            "loan_type": req.loan_type,
+            "principal": req.principal,
+            "annual_interest_rate": req.annual_interest_rate,
+            "tenure_months": req.tenure_months,
+            "start_date": req.start_date,
+        }).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"ok": True}
+
+
+@app.delete("/loans/{email}/{loan_id}")
+def delete_loan(email: str, loan_id: int):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        sb.table("loans").delete().eq("id", loan_id).eq(
+            "user_email", email).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"ok": True}
+
+
+# ---- Pending dues ----
+class PendingRequest(BaseModel):
+    description: str
+    amount: float
+    due_date: str
+    category: Optional[str] = None
+
+
+@app.get("/pending/{email}")
+def get_pending(email: str, status: str = "PENDING"):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        res = sb.table("pending_payments").select("*").eq(
+            "user_email", email).eq("status", status.upper()).order(
+            "due_date").execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"pending": res.data or []}
+
+
+@app.post("/pending/{email}")
+def add_pending(email: str, req: PendingRequest):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        sb.table("pending_payments").insert({
+            "user_email": email,
+            "description": req.description,
+            "amount": req.amount,
+            "due_date": req.due_date,
+            "category": req.category,
+            "status": "PENDING",
+        }).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"ok": True}
+
+
+@app.post("/pending/{email}/{payment_id}/mark-paid")
+def mark_paid(email: str, payment_id: int):
+    from datetime import datetime, timezone
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        sb.table("pending_payments").update({
+            "status": "PAID",
+            "paid_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", payment_id).eq("user_email", email).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"ok": True}
+
+
+@app.delete("/pending/{email}/{payment_id}")
+def delete_pending(email: str, payment_id: int):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        sb.table("pending_payments").delete().eq("id", payment_id).eq(
+            "user_email", email).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"ok": True}
+
+
+# ===========================================================================
 # HOLDINGS  (persisted per user — same table as the web app)
 # ===========================================================================
 class HoldingIn(BaseModel):
