@@ -1581,7 +1581,7 @@ def stock_research_pdf(symbol: str):
     pdf.set_y(card_y + 24)
 
     # ---- Analyst consensus ----
-    if consensus:
+    if consensus and (consensus.get("target") or consensus.get("n_analysts")):
         _section(pdf, "Analyst Consensus (Yahoo Finance)", ACCENT_EMERALD)
         pdf.set_font("Helvetica", "", 9.5)
         pdf.set_text_color(50, 50, 50)
