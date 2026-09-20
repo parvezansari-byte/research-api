@@ -2424,6 +2424,13 @@ def get_expense_summary(email: str, month: Optional[str] = None):
         "month": month,
         "by_category": [{"category": k, "amount": round(v, 2)}
                         for k, v in sorted(by_cat.items(), key=lambda x: -x[1])],
+        # The app's Spending tab reads this shape specifically (each entry
+        # needs a "percent" 0-100 value for its progress bar).
+        "category_breakdown": [
+            {"category": k, "amount": round(v, 2),
+             "percent": round(v / total * 100, 1) if total > 0 else 0}
+            for k, v in sorted(by_cat.items(), key=lambda x: -x[1])
+        ],
         "by_day": [{"date": k, "amount": round(v, 2)}
                    for k, v in sorted(by_day.items())],
     })
@@ -2499,12 +2506,31 @@ def get_loans(email: str):
     rows = res.data or []
     total_debt = 0.0
     total_emi = 0.0
+    from datetime import date as _date
+    today = _date.today()
     for r in rows:
         principal = float(r.get("principal") or 0)
         rate = float(r.get("annual_interest_rate") or 0)
         months = int(r.get("tenure_months") or 0)
         emi = _emi(principal, rate, months)
         r["monthly_emi"] = emi
+
+        # months_elapsed: the app's Loans tab uses this (vs tenure_months)
+        # to show repayment progress - not stored, computed from start_date.
+        months_elapsed = 0
+        start_str = r.get("start_date")
+        if start_str:
+            try:
+                start = _date.fromisoformat(str(start_str)[:10])
+                months_elapsed = (today.year - start.year) * 12 + (
+                    today.month - start.month)
+                if today.day < start.day:
+                    months_elapsed -= 1
+                months_elapsed = max(0, months_elapsed)
+            except ValueError:
+                months_elapsed = 0
+        r["months_elapsed"] = months_elapsed
+
         total_debt += principal
         total_emi += emi
 
