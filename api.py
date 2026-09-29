@@ -954,14 +954,52 @@ def _mr_fetch_snapshot(period: str) -> list:
 def _mr_fii_dii_summary(period: str):
     cfg = _MR_PERIOD_CONFIG[period]
     try:
-        result = fii_dii_history(days=cfg["fii_days"])   # reuses your existing endpoint function
+        result = fii_dii_history(days=cfg["fii_days"])   # reuses the existing endpoint function
         return result.get("summary")
     except HTTPException:
         return None
 
 
-def _mr_ai_narrative(snapshot: list, fii_dii, period: str) -> str:
-    import os
+def _mr_fetch_news_highlights(limit: int = 5) -> list:
+    """Real recent headlines from the app's own RSS feeds (same source as the
+    News tab) - ranked High-impact first, then most recent. Never AI-written;
+    these are genuine article titles with a real link, source, and age."""
+    try:
+        rows = _m_cached("news", 600, _m_fetch_news)
+    except Exception:
+        return []
+    _impact_rank = {"High": 2, "Medium": 1, "Low": 0}
+    ranked = sorted(
+        rows,
+        key=lambda r: (_impact_rank.get(r.get("impact"), 0),
+                       r.get("_published") or _mdatetime.min.replace(tzinfo=_mtimezone.utc)),
+        reverse=True,
+    )
+    out = []
+    for r in ranked[:limit]:
+        out.append({
+            "title": r["title"], "source": r["source"], "sentiment": r["sentiment"],
+            "impact": r["impact"], "age": _m_age_str(r["_published"]), "link": r["link"],
+        })
+    return out
+
+
+def _mr_tone(snapshot: list) -> tuple:
+    """A simple, transparent risk-on/risk-off read computed only from the
+    snapshot numbers above - not a prediction, just a plain-language label
+    for the same data shown in the table."""
+    idx = [r["change_pct"] for r in snapshot if r["category"] == "Indices"]
+    vix = next((r["change_pct"] for r in snapshot if r["name"] == "India VIX"), 0)
+    avg_idx = sum(idx) / len(idx) if idx else 0
+    if avg_idx <= -1.5 and vix >= 5:
+        return ("RISK-OFF", "red")
+    if avg_idx >= 1.5 and vix <= -5:
+        return ("RISK-ON", "green")
+    return ("MIXED / NEUTRAL", "amber")
+
+
+def _mr_ai_narrative(snapshot: list, fii_dii, news: list, period: str) -> str:
+    import os, time as _mrtime
     try:
         from google import genai
     except ImportError:
@@ -977,10 +1015,14 @@ def _mr_ai_narrative(snapshot: list, fii_dii, period: str) -> str:
                           f"over {fii_dii['total_days']} trading day(s)")
         facts_lines.append(f"- DII net flow: Rs {fii_dii['dii_net_total']:.0f} cr "
                           f"over {fii_dii['total_days']} trading day(s)")
+    if news:
+        facts_lines.append("Recent real headlines (for context only, do not invent beyond these):")
+        for n in news:
+            facts_lines.append(f"  - [{n['impact']} impact, {n['sentiment']}] {n['title']} ({n['source']}, {n['age']})")
     facts = "\n".join(facts_lines)
     label = _MR_PERIOD_CONFIG[period]["label"]
 
-    prompt = f"""You are a market commentator writing a {label.lower()} market snapshot for a retail investor in India. You do NOT have access to today's news - you only have the numbers below. Do not invent any news, events, or citations.
+    prompt = f"""You are a market commentator writing a {label.lower()} market snapshot for a retail investor in India. Do not invent any news, events, or citations beyond the real headlines listed below (if any) - those are genuine, already-published articles; everything else is real market data.
 
 Data for this {label.lower()} period:
 {facts}
@@ -989,15 +1031,23 @@ Write a short {label.lower()} market brief with:
 **Snapshot** - 1-2 sentences on overall tone (risk-on/risk-off), purely from the numbers above.
 **Notable move** - call out whichever instrument moved the most, and by how much.
 **Flows** - one sentence on FII/DII activity, if provided.
+**Headlines in context** - one sentence connecting the real headlines above (if any) to the market moves, without adding any headline of your own.
 
-Rules: use ONLY the numbers given; never invent a news event, headline, or economic data release; never give buy/sell/hold advice. Under 150 words."""
+Rules: use ONLY the numbers and headlines given; never invent a news event, headline, or economic data release beyond what's listed; never give buy/sell/hold advice. Under 170 words."""
 
-    try:
-        client = genai.Client(api_key=key)
-        resp = client.models.generate_content(model="gemini-flash-latest", contents=prompt)
-        return (resp.text or "").strip()
-    except Exception as e:
-        return f"AI narrative unavailable ({e})."
+    last_err = None
+    for attempt in range(2):
+        try:
+            client = genai.Client(api_key=key)
+            resp = client.models.generate_content(model="gemini-flash-latest", contents=prompt)
+            return (resp.text or "").strip()
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                _mrtime.sleep(1.5)
+    return ("AI commentary is temporarily unavailable - the model is under heavy load right now. "
+            "The market data and headlines above are unaffected; try generating the report again "
+            f"shortly. ({last_err})")
 
 
 def _mr_build_report(period: str) -> dict:
@@ -1008,107 +1058,211 @@ def _mr_build_report(period: str) -> dict:
     if not snapshot:
         raise HTTPException(502, "No market data available right now")
     fii_dii = _mr_fii_dii_summary(period)
-    narrative = _mr_ai_narrative(snapshot, fii_dii, period)
+    news = _mr_fetch_news_highlights()
+    tone_label, tone_color = _mr_tone(snapshot)
+    narrative = _mr_ai_narrative(snapshot, fii_dii, news, period)
     from datetime import datetime as _mrdt, timezone as _mrtz, timedelta as _mrtd
     ist = _mrtz(_mrtd(hours=5, minutes=30))
     return {
         "period": period,
         "period_label": _MR_PERIOD_CONFIG[period]["label"],
         "generated_at": _mrdt.now(ist).strftime("%d %b %Y, %I:%M %p IST"),
+        "tone": tone_label,
+        "tone_color": tone_color,
         "snapshot": snapshot,
         "fii_dii": fii_dii,
+        "news": news,
         "ai_summary": narrative,
     }
 
 
 @app.get("/market/macro-report")
 def macro_report(period: str = "daily"):
-    """Real market snapshot (indices/commodities/currency/VIX/FII-DII) plus a
-    data-grounded AI narrative - no fabricated news citations."""
+    """Real market snapshot (indices/commodities/currency/VIX/FII-DII), real
+    recent headlines from the app's own news feeds, and a data-grounded AI
+    narrative - no fabricated news citations."""
     return _clean(_mr_build_report(period))
 
 
 def _mr_build_pdf(report: dict) -> bytes:
     from fpdf import FPDF
 
-    ACCENT = (6, 182, 212)
-    HEADER_BG = (8, 28, 38)
+    NAVY = (8, 28, 38)
+    CYAN = (6, 182, 212)
+    GOLD = (217, 164, 6)
     GREEN = (16, 185, 129)
-    RED = (239, 68, 68)
+    RED = (225, 60, 60)
+    AMBER = (245, 158, 11)
     GREY = (100, 116, 139)
     INK = (30, 41, 59)
+    LIGHT_GREEN_BG = (223, 246, 237)
+    LIGHT_RED_BG = (252, 226, 226)
+    LIGHT_GREY_BG = (243, 246, 248)
+    WHITE = (255, 255, 255)
+
+    _TONE_COLOR = {"red": RED, "green": GREEN, "amber": AMBER}
+    tone_rgb = _TONE_COLOR.get(report.get("tone_color"), AMBER)
 
     class StyledPDF(FPDF):
         def header(self):
-            self.set_fill_color(*HEADER_BG)
-            self.rect(0, 0, 210, 28, "F")
+            self.set_fill_color(*NAVY)
+            self.rect(0, 0, 210, 30, "F")
+            self.set_fill_color(*GOLD)
+            self.rect(0, 30, 210, 1.2, "F")
             self.set_xy(10, 8)
-            self.set_text_color(255, 255, 255)
-            self.set_font("Helvetica", "B", 16)
-            self.cell(0, 8, "ADVANTAGE - Macro Market Report", ln=1)
+            self.set_text_color(*WHITE)
+            self.set_font("Helvetica", "B", 17)
+            self.cell(0, 8, "ADVANTAGE", ln=1)
             self.set_x(10)
-            self.set_font("Helvetica", "", 10)
-            self.set_text_color(*ACCENT)
-            self.cell(0, 6, f"{report['period_label']} snapshot - generated {report['generated_at']}", ln=1)
-            self.set_y(32)
+            self.set_font("Helvetica", "B", 10.5)
+            self.set_text_color(*CYAN)
+            self.cell(0, 6, "MACRO MARKET REPORT", ln=1)
+            self.set_x(10)
+            self.set_font("Helvetica", "", 8.5)
+            self.set_text_color(200, 214, 220)
+            self.cell(0, 5, f"{report['period_label']} snapshot  -  generated {report['generated_at']}", ln=1)
+            # period badge, top-right
+            self.set_font("Helvetica", "B", 9)
+            badge_w = 26
+            self.set_xy(210 - 10 - badge_w, 10)
+            self.set_fill_color(*GOLD)
+            self.set_text_color(*NAVY)
+            self.cell(badge_w, 8, report["period_label"].upper(), 0, 0, "C", True)
+            self.set_y(36)
 
         def footer(self):
             self.set_y(-15)
-            self.set_font("Helvetica", "I", 8)
+            self.set_draw_color(*GREY)
+            self.line(10, self.get_y(), 200, self.get_y())
+            self.set_font("Helvetica", "I", 7.5)
             self.set_text_color(*GREY)
             self.cell(0, 10, "AI-generated commentary describes the data above only - not "
-                            f"financial advice.  Page {self.page_no()}", align="C")
+                            f"financial advice.   Page {self.page_no()}", align="C")
 
-    def _section(pdf, title):
-        pdf.ln(4)
-        pdf.set_font("Helvetica", "B", 13)
-        pdf.set_text_color(*ACCENT)
-        pdf.cell(0, 8, title, ln=1)
-        pdf.set_draw_color(*ACCENT)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-        pdf.ln(3)
+    def _section(pdf, title, rgb=CYAN):
+        pdf.ln(5)
+        pdf.set_fill_color(*rgb)
+        pdf.rect(10, pdf.get_y() + 1.2, 3, 5, "F")
+        pdf.set_x(16)
+        pdf.set_font("Helvetica", "B", 12.5)
+        pdf.set_text_color(*INK)
+        pdf.cell(0, 7.5, title, ln=1)
+        pdf.ln(2)
 
     pdf = StyledPDF()
     pdf.add_page()
 
+    # ---- Tone banner ----
+    pdf.set_fill_color(*tone_rgb)
+    pdf.rect(10, pdf.get_y(), 190, 12, "F")
+    pdf.set_xy(14, pdf.get_y() + 2.8)
+    pdf.set_text_color(*WHITE)
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 6, f"OVERALL TONE:  {report.get('tone', 'MIXED / NEUTRAL')}")
+    pdf.ln(16)
+
+    # ---- Market snapshot table ----
     _section(pdf, "MARKET SNAPSHOT")
     pdf.set_font("Helvetica", "B", 10)
-    pdf.set_fill_color(*HEADER_BG)
-    pdf.set_text_color(255, 255, 255)
-    pdf.cell(70, 8, "Instrument", 1, 0, "L", True)
-    pdf.cell(40, 8, "Value", 1, 0, "R", True)
-    pdf.cell(40, 8, "Change", 1, 1, "R", True)
+    pdf.set_fill_color(*NAVY)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(80, 8, "  Instrument", 0, 0, "L", True)
+    pdf.cell(45, 8, "Value", 0, 0, "R", True)
+    pdf.cell(45, 8, "Change  ", 0, 1, "R", True)
     pdf.set_font("Helvetica", "", 10)
     for i, r in enumerate(report["snapshot"]):
-        fill = (245, 250, 251) if i % 2 == 0 else (255, 255, 255)
-        pdf.set_fill_color(*fill)
-        pdf.set_text_color(*INK)
-        pdf.cell(70, 8, r["name"], 1, 0, "L", True)
-        pdf.cell(40, 8, f"{r['value']:,.2f}", 1, 0, "R", True)
-        color = GREEN if r["change_pct"] >= 0 else RED
-        pdf.set_text_color(*color)
-        pdf.cell(40, 8, f"{r['change_pct']:+.2f}%", 1, 1, "R", True)
+        row_bg = (245, 250, 251) if i % 2 == 0 else WHITE
+        up = r["change_pct"] >= 0
+        chg_bg = LIGHT_GREEN_BG if up else LIGHT_RED_BG
+        chg_color = GREEN if up else RED
+        arrow = "▲" if up else "▼"
 
+        pdf.set_fill_color(*row_bg)
+        pdf.set_text_color(*INK)
+        pdf.cell(80, 8.5, f"  {r['name']}", 0, 0, "L", True)
+        pdf.cell(45, 8.5, f"{r['value']:,.2f}  ", 0, 0, "R", True)
+
+        pdf.set_fill_color(*chg_bg)
+        pdf.set_text_color(*chg_color)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(45, 8.5, f"{arrow} {r['change_pct']:+.2f}%  ", 0, 1, "R", True)
+        pdf.set_font("Helvetica", "", 10)
+
+    # ---- FII / DII activity ----
     fd = report.get("fii_dii")
     if fd:
-        _section(pdf, "FII / DII ACTIVITY")
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_text_color(*INK)
-        pdf.multi_cell(0, 7,
-            f"FII net flow: Rs {fd['fii_net_total']:,.0f} cr   |   "
-            f"DII net flow: Rs {fd['dii_net_total']:,.0f} cr   |   "
-            f"Combined: Rs {fd['combined_net']:,.0f} cr over {fd['total_days']} trading day(s)")
+        _section(pdf, "FII / DII ACTIVITY", GOLD)
+        box_w = 60
+        gap = 5
+        x0 = pdf.get_x()
+        y0 = pdf.get_y()
+        cards = [
+            ("FII NET", fd["fii_net_total"]),
+            ("DII NET", fd["dii_net_total"]),
+            ("COMBINED", fd["combined_net"]),
+        ]
+        for i, (label, val) in enumerate(cards):
+            x = x0 + i * (box_w + gap)
+            color = GREEN if val >= 0 else RED
+            bg = LIGHT_GREEN_BG if val >= 0 else LIGHT_RED_BG
+            pdf.set_xy(x, y0)
+            pdf.set_fill_color(*bg)
+            pdf.rect(x, y0, box_w, 22, "F")
+            pdf.set_xy(x, y0 + 3)
+            pdf.set_font("Helvetica", "B", 8.5)
+            pdf.set_text_color(*GREY)
+            pdf.cell(box_w, 5, label, 0, 2, "C")
+            pdf.set_x(x)
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.set_text_color(*color)
+            pdf.cell(box_w, 8, f"Rs {val:,.0f} cr", 0, 2, "C")
+        pdf.set_y(y0 + 26)
+        pdf.set_font("Helvetica", "I", 8.5)
+        pdf.set_text_color(*GREY)
+        pdf.cell(0, 6, f"Over the available {fd['total_days']} trading day(s) of data  -  "
+                       f"{fd['fii_buying_days']} FII-buying day(s)", ln=1)
 
-    _section(pdf, "AI ANALYSIS")
+    # ---- News highlights (real headlines, not AI-written) ----
+    news = report.get("news") or []
+    if news:
+        _section(pdf, "MARKET NEWS HIGHLIGHTS", CYAN)
+        _impact_color = {"High": RED, "Medium": AMBER, "Low": GREY}
+        for n in news:
+            color = _impact_color.get(n.get("impact"), GREY)
+            y_start = pdf.get_y()
+            pdf.set_fill_color(*color)
+            pdf.rect(10, y_start, 1.6, 11, "F")
+            pdf.set_x(14)
+            pdf.set_font("Helvetica", "B", 9.5)
+            pdf.set_text_color(*INK)
+            pdf.multi_cell(150, 5, n["title"])
+            pdf.set_x(14)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.set_text_color(*GREY)
+            pdf.cell(0, 4.5, f"{n['source']}  -  {n['age']}  -  {n['impact']} impact, {n['sentiment']}", ln=1)
+            pdf.ln(1.5)
+
+    # ---- AI analysis ----
+    _section(pdf, "AI ANALYSIS", GOLD)
+    pdf.set_fill_color(*LIGHT_GREY_BG)
+    box_y = pdf.get_y()
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(*INK)
+    lines_out = []
     for line in report["ai_summary"].split("\n"):
         clean_line = line.replace("**", "").strip()
+        lines_out.append((clean_line, line.strip().startswith("**")))
+    # estimate box height then draw background, then redraw text on top
+    pdf.set_xy(14, box_y + 3)
+    for clean_line, is_bold in lines_out:
         if clean_line:
-            pdf.set_font("Helvetica", "B" if line.strip().startswith("**") else "", 10)
-            pdf.multi_cell(0, 6.5, clean_line)
+            pdf.set_x(14)
+            pdf.set_font("Helvetica", "B" if is_bold else "", 10)
+            pdf.multi_cell(182, 6, clean_line)
         else:
             pdf.ln(2)
+    box_h = pdf.get_y() - box_y + 3
+    pdf.rect(10, box_y, 190, box_h, "D")
 
     return bytes(pdf.output())
 
