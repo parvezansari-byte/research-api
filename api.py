@@ -910,6 +910,221 @@ def fii_dii_history(days: int = 30):
 
 
 # =============================================================================
+# MACRO / MARKET REPORT  (daily / weekly / monthly PDF)
+# =============================================================================
+_MR_INSTRUMENTS = {
+    "Nifty 50":         ("^NSEI",     "Indices"),
+    "Sensex":           ("^BSESN",    "Indices"),
+    "Bank Nifty":       ("^NSEBANK",  "Indices"),
+    "India VIX":        ("^INDIAVIX", "Volatility"),
+    "Crude Oil (WTI)":  ("CL=F",      "Commodities"),
+    "Gold":             ("GC=F",      "Commodities"),
+    "USD/INR":          ("INR=X",     "Currency"),
+}
+
+_MR_PERIOD_CONFIG = {
+    "daily":   {"yf_period": "5d",  "lookback": 1,  "fii_days": 1,  "label": "Daily"},
+    "weekly":  {"yf_period": "1mo", "lookback": 5,  "fii_days": 5,  "label": "Weekly"},
+    "monthly": {"yf_period": "3mo", "lookback": 21, "fii_days": 22, "label": "Monthly"},
+}
+
+
+def _mr_fetch_snapshot(period: str) -> list:
+    cfg = _MR_PERIOD_CONFIG[period]
+    symbols = [sym for sym, _ in _MR_INSTRUMENTS.values()]
+    data = _myf.download(symbols, period=cfg["yf_period"], progress=False,
+                         auto_adjust=True, group_by="ticker", threads=True)
+    rows = []
+    for name, (sym, category) in _MR_INSTRUMENTS.items():
+        try:
+            closes = data[sym]["Close"].dropna() if len(symbols) > 1 else data["Close"].dropna()
+            if closes.empty:
+                continue
+            latest = float(closes.iloc[-1])
+            back_idx = min(cfg["lookback"], len(closes) - 1)
+            prev = float(closes.iloc[-1 - back_idx]) if back_idx > 0 else latest
+            change_pct = (latest / prev - 1) * 100 if prev else 0
+            rows.append({"name": name, "category": category,
+                        "value": round(latest, 2), "change_pct": round(change_pct, 2)})
+        except Exception:
+            continue
+    return rows
+
+
+def _mr_fii_dii_summary(period: str):
+    cfg = _MR_PERIOD_CONFIG[period]
+    try:
+        result = fii_dii_history(days=cfg["fii_days"])   # reuses your existing endpoint function
+        return result.get("summary")
+    except HTTPException:
+        return None
+
+
+def _mr_ai_narrative(snapshot: list, fii_dii, period: str) -> str:
+    import os
+    try:
+        from google import genai
+    except ImportError:
+        return "AI narrative unavailable (google-genai not installed)."
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return "AI narrative unavailable (GEMINI_API_KEY not set)."
+
+    facts_lines = [f"- {r['name']}: {r['value']} ({r['change_pct']:+.2f}% over this period)"
+                  for r in snapshot]
+    if fii_dii:
+        facts_lines.append(f"- FII net flow: Rs {fii_dii['fii_net_total']:.0f} cr "
+                          f"over {fii_dii['total_days']} trading day(s)")
+        facts_lines.append(f"- DII net flow: Rs {fii_dii['dii_net_total']:.0f} cr "
+                          f"over {fii_dii['total_days']} trading day(s)")
+    facts = "\n".join(facts_lines)
+    label = _MR_PERIOD_CONFIG[period]["label"]
+
+    prompt = f"""You are a market commentator writing a {label.lower()} market snapshot for a retail investor in India. You do NOT have access to today's news - you only have the numbers below. Do not invent any news, events, or citations.
+
+Data for this {label.lower()} period:
+{facts}
+
+Write a short {label.lower()} market brief with:
+**Snapshot** - 1-2 sentences on overall tone (risk-on/risk-off), purely from the numbers above.
+**Notable move** - call out whichever instrument moved the most, and by how much.
+**Flows** - one sentence on FII/DII activity, if provided.
+
+Rules: use ONLY the numbers given; never invent a news event, headline, or economic data release; never give buy/sell/hold advice. Under 150 words."""
+
+    try:
+        client = genai.Client(api_key=key)
+        resp = client.models.generate_content(model="gemini-flash-latest", contents=prompt)
+        return (resp.text or "").strip()
+    except Exception as e:
+        return f"AI narrative unavailable ({e})."
+
+
+def _mr_build_report(period: str) -> dict:
+    period = period.lower()
+    if period not in _MR_PERIOD_CONFIG:
+        raise HTTPException(400, "period must be daily, weekly, or monthly")
+    snapshot = _mr_fetch_snapshot(period)
+    if not snapshot:
+        raise HTTPException(502, "No market data available right now")
+    fii_dii = _mr_fii_dii_summary(period)
+    narrative = _mr_ai_narrative(snapshot, fii_dii, period)
+    from datetime import datetime as _mrdt, timezone as _mrtz, timedelta as _mrtd
+    ist = _mrtz(_mrtd(hours=5, minutes=30))
+    return {
+        "period": period,
+        "period_label": _MR_PERIOD_CONFIG[period]["label"],
+        "generated_at": _mrdt.now(ist).strftime("%d %b %Y, %I:%M %p IST"),
+        "snapshot": snapshot,
+        "fii_dii": fii_dii,
+        "ai_summary": narrative,
+    }
+
+
+@app.get("/market/macro-report")
+def macro_report(period: str = "daily"):
+    """Real market snapshot (indices/commodities/currency/VIX/FII-DII) plus a
+    data-grounded AI narrative - no fabricated news citations."""
+    return _clean(_mr_build_report(period))
+
+
+def _mr_build_pdf(report: dict) -> bytes:
+    from fpdf import FPDF
+
+    ACCENT = (6, 182, 212)
+    HEADER_BG = (8, 28, 38)
+    GREEN = (16, 185, 129)
+    RED = (239, 68, 68)
+    GREY = (100, 116, 139)
+    INK = (30, 41, 59)
+
+    class StyledPDF(FPDF):
+        def header(self):
+            self.set_fill_color(*HEADER_BG)
+            self.rect(0, 0, 210, 28, "F")
+            self.set_xy(10, 8)
+            self.set_text_color(255, 255, 255)
+            self.set_font("Helvetica", "B", 16)
+            self.cell(0, 8, "ADVANTAGE - Macro Market Report", ln=1)
+            self.set_x(10)
+            self.set_font("Helvetica", "", 10)
+            self.set_text_color(*ACCENT)
+            self.cell(0, 6, f"{report['period_label']} snapshot - generated {report['generated_at']}", ln=1)
+            self.set_y(32)
+
+        def footer(self):
+            self.set_y(-15)
+            self.set_font("Helvetica", "I", 8)
+            self.set_text_color(*GREY)
+            self.cell(0, 10, "AI-generated commentary describes the data above only - not "
+                            f"financial advice.  Page {self.page_no()}", align="C")
+
+    def _section(pdf, title):
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(*ACCENT)
+        pdf.cell(0, 8, title, ln=1)
+        pdf.set_draw_color(*ACCENT)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(3)
+
+    pdf = StyledPDF()
+    pdf.add_page()
+
+    _section(pdf, "MARKET SNAPSHOT")
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(*HEADER_BG)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(70, 8, "Instrument", 1, 0, "L", True)
+    pdf.cell(40, 8, "Value", 1, 0, "R", True)
+    pdf.cell(40, 8, "Change", 1, 1, "R", True)
+    pdf.set_font("Helvetica", "", 10)
+    for i, r in enumerate(report["snapshot"]):
+        fill = (245, 250, 251) if i % 2 == 0 else (255, 255, 255)
+        pdf.set_fill_color(*fill)
+        pdf.set_text_color(*INK)
+        pdf.cell(70, 8, r["name"], 1, 0, "L", True)
+        pdf.cell(40, 8, f"{r['value']:,.2f}", 1, 0, "R", True)
+        color = GREEN if r["change_pct"] >= 0 else RED
+        pdf.set_text_color(*color)
+        pdf.cell(40, 8, f"{r['change_pct']:+.2f}%", 1, 1, "R", True)
+
+    fd = report.get("fii_dii")
+    if fd:
+        _section(pdf, "FII / DII ACTIVITY")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(*INK)
+        pdf.multi_cell(0, 7,
+            f"FII net flow: Rs {fd['fii_net_total']:,.0f} cr   |   "
+            f"DII net flow: Rs {fd['dii_net_total']:,.0f} cr   |   "
+            f"Combined: Rs {fd['combined_net']:,.0f} cr over {fd['total_days']} trading day(s)")
+
+    _section(pdf, "AI ANALYSIS")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(*INK)
+    for line in report["ai_summary"].split("\n"):
+        clean_line = line.replace("**", "").strip()
+        if clean_line:
+            pdf.set_font("Helvetica", "B" if line.strip().startswith("**") else "", 10)
+            pdf.multi_cell(0, 6.5, clean_line)
+        else:
+            pdf.ln(2)
+
+    return bytes(pdf.output())
+
+
+@app.get("/market/macro-report/pdf")
+def macro_report_pdf(period: str = "daily"):
+    from fastapi import Response
+    report = _mr_build_report(period)
+    pdf_bytes = _mr_build_pdf(report)
+    return Response(
+        content=pdf_bytes, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="macro_report_{period}.pdf"'},
+    )
+
+
+# =============================================================================
 # MARKET NEWS
 # =============================================================================
 _M_FEEDS = {
