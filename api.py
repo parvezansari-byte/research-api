@@ -929,11 +929,30 @@ _MR_PERIOD_CONFIG = {
 }
 
 
+def _mr_yf_download(*args, timeout=15, **kwargs):
+    """yfinance / Yahoo Finance occasionally rate-limits the anti-bot "crumb"
+    request (HTTP 429) and can then hang retrying internally for a long
+    time - long enough to blow past Render/Cloudflare's proxy timeout and
+    come back as an opaque 520 with no useful error. Bound the call with a
+    hard timeout so a rate-limit turns into a fast, clear error instead."""
+    import concurrent.futures
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(_myf.download, *args, **kwargs)
+    try:
+        result = fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        ex.shutdown(wait=False)
+        raise HTTPException(503, "Market data provider (Yahoo Finance) is rate-limited or "
+                                 "slow right now - please retry in a few minutes.")
+    ex.shutdown(wait=False)
+    return result
+
+
 def _mr_fetch_snapshot(period: str) -> list:
     cfg = _MR_PERIOD_CONFIG[period]
     symbols = [sym for sym, _ in _MR_INSTRUMENTS.values()]
-    data = _myf.download(symbols, period=cfg["yf_period"], progress=False,
-                         auto_adjust=True, group_by="ticker", threads=True)
+    data = _mr_yf_download(symbols, period=cfg["yf_period"], progress=False,
+                           auto_adjust=True, group_by="ticker", threads=True)
     rows = []
     for name, (sym, category) in _MR_INSTRUMENTS.items():
         try:
@@ -989,7 +1008,8 @@ def _mr_fetch_nifty_series(period: str) -> list:
     used to draw the trend chart in the PDF."""
     cfg = _MR_PERIOD_CONFIG[period]
     try:
-        data = _myf.download("^NSEI", period=cfg["yf_period"], progress=False, auto_adjust=True)
+        data = _mr_yf_download("^NSEI", period=cfg["yf_period"], progress=False,
+                               auto_adjust=True, timeout=10)
         closes = data["Close"].dropna()
         out = []
         for idx, val in closes.items():
@@ -1524,11 +1544,24 @@ def _m_extract_image(entry, raw_summary: str) -> str:
 
 
 def _m_fetch_news():
-    import feedparser
+    # feedparser.parse() has NO timeout by default and can hang indefinitely
+    # on a slow/unresponsive feed (see _rr_stock_news for the same fix) -
+    # bound each feed with a short socket timeout and an overall time
+    # budget so one bad feed can't hang this (and anything that calls it,
+    # like the Macro Report's news section) past a request proxy's timeout.
+    import feedparser, socket, time as _mnt
     rows = []
-    for source, url in _M_FEEDS.items():
-        try:
-            feed = feedparser.parse(url)
+    start = _mnt.time()
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(4)
+    try:
+        for source, url in _M_FEEDS.items():
+            if _mnt.time() - start > 12:
+                break
+            try:
+                feed = feedparser.parse(url)
+            except Exception:
+                continue
             for e in feed.entries[:15]:
                 title = _m_strip_html(getattr(e, "title", ""))
                 raw_summary = getattr(e, "summary", "")
@@ -1548,8 +1581,8 @@ def _m_fetch_news():
                     "source": source, "_published": published, "image": image,
                     "sentiment": _m_classify_sentiment(text), "impact": _m_classify_impact(text),
                 })
-        except Exception:
-            continue
+    finally:
+        socket.setdefaulttimeout(old_timeout)
     seen_titles = set()
     unique = []
     for r in rows:
