@@ -984,6 +984,21 @@ def _mr_fetch_news_highlights(limit: int = 5) -> list:
     return out
 
 
+def _mr_fetch_nifty_series(period: str) -> list:
+    """Nifty 50 closing prices over the same lookback window as the snapshot -
+    used to draw the trend chart in the PDF."""
+    cfg = _MR_PERIOD_CONFIG[period]
+    try:
+        data = _myf.download("^NSEI", period=cfg["yf_period"], progress=False, auto_adjust=True)
+        closes = data["Close"].dropna()
+        out = []
+        for idx, val in closes.items():
+            out.append({"date": idx.strftime("%d %b"), "close": round(float(val), 2)})
+        return out
+    except Exception:
+        return []
+
+
 def _mr_tone(snapshot: list) -> tuple:
     """A simple, transparent risk-on/risk-off read computed only from the
     snapshot numbers above - not a prediction, just a plain-language label
@@ -1043,11 +1058,26 @@ Rules: use ONLY the numbers and headlines given; never invent a news event, head
             return (resp.text or "").strip()
         except Exception as e:
             last_err = e
-            if attempt == 0:
+            err_str = str(e)
+            # A quota error (429 RESOURCE_EXHAUSTED) won't fix itself in 1.5s -
+            # retrying immediately just burns another unit of the same daily
+            # quota. Only retry transient overload errors (503 UNAVAILABLE).
+            if attempt == 0 and "RESOURCE_EXHAUSTED" not in err_str and "429" not in err_str:
                 _mrtime.sleep(1.5)
-    return ("AI commentary is temporarily unavailable - the model is under heavy load right now. "
-            "The market data and headlines above are unaffected; try generating the report again "
-            f"shortly. ({last_err})")
+            else:
+                break
+
+    err_str = str(last_err)
+    if "RESOURCE_EXHAUSTED" in err_str or "429" in err_str or "quota" in err_str.lower():
+        msg = ("AI commentary isn't available right now - the daily free quota for the AI "
+               "model has been used up. The market data, FII/DII flows and headlines above "
+               "are all live and unaffected; the AI summary will resume once the quota "
+               "resets (Gemini's free tier resets daily).")
+    else:
+        msg = ("AI commentary is temporarily unavailable - the model is under heavy load "
+               "right now. The market data and headlines above are unaffected; try "
+               "generating the report again shortly.")
+    return msg
 
 
 def _mr_build_report(period: str) -> dict:
@@ -1059,8 +1089,13 @@ def _mr_build_report(period: str) -> dict:
         raise HTTPException(502, "No market data available right now")
     fii_dii = _mr_fii_dii_summary(period)
     news = _mr_fetch_news_highlights()
+    nifty_series = _mr_fetch_nifty_series(period)
     tone_label, tone_color = _mr_tone(snapshot)
-    narrative = _mr_ai_narrative(snapshot, fii_dii, news, period)
+    # Cache the AI narrative per period for a few minutes - re-tapping
+    # "Generate Report" or opening daily/weekly/monthly back-to-back
+    # shouldn't burn additional Gemini free-tier quota for near-identical data.
+    narrative = _m_cached(f"macro_ai:{period}", 900,
+                          lambda: _mr_ai_narrative(snapshot, fii_dii, news, period))
     from datetime import datetime as _mrdt, timezone as _mrtz, timedelta as _mrtd
     ist = _mrtz(_mrtd(hours=5, minutes=30))
     return {
@@ -1072,6 +1107,7 @@ def _mr_build_report(period: str) -> dict:
         "snapshot": snapshot,
         "fii_dii": fii_dii,
         "news": news,
+        "nifty_series": nifty_series,
         "ai_summary": narrative,
     }
 
@@ -1167,6 +1203,44 @@ def _mr_build_pdf(report: dict) -> bytes:
         pdf.cell(0, 7.5, title, ln=1)
         pdf.ln(2)
 
+    def _nifty_chart(pdf, series, line_rgb):
+        """Draws a Nifty 50 trend line directly with FPDF primitives - no
+        extra chart library / dependency needed."""
+        if not series or len(series) < 2:
+            return
+        x0, y0 = 14, pdf.get_y() + 2
+        w, h = 182, 40
+        closes = [p["close"] for p in series]
+        lo, hi = min(closes), max(closes)
+        rng = (hi - lo) or 1
+
+        pdf.set_draw_color(220, 226, 230)
+        pdf.set_line_width(0.3)
+        pdf.rect(x0, y0, w, h)
+        for i in (1, 2):
+            y = y0 + h * i / 3
+            pdf.line(x0, y, x0 + w, y)
+
+        n = len(closes)
+        pts = [(x0 + (w * i / (n - 1)), y0 + h - ((c - lo) / rng) * h)
+               for i, c in enumerate(closes)]
+        pdf.set_draw_color(*line_rgb)
+        pdf.set_line_width(0.7)
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            pdf.line(x1, y1, x2, y2)
+
+        pdf.set_font("Helvetica", "", 7)
+        pdf.set_text_color(120, 130, 140)
+        pdf.set_xy(x0, y0 - 4.5)
+        pdf.cell(w * 0.5, 4, _mr_safe(f"High {hi:,.0f}"))
+        pdf.set_xy(x0 + w * 0.5, y0 - 4.5)
+        pdf.cell(w * 0.5, 4, _mr_safe(f"Low {lo:,.0f}"), align="R")
+        pdf.set_xy(x0, y0 + h + 1.5)
+        pdf.cell(w * 0.5, 4, _mr_safe(series[0]["date"]))
+        pdf.set_xy(x0 + w * 0.5, y0 + h + 1.5)
+        pdf.cell(w * 0.5, 4, _mr_safe(series[-1]["date"]), align="R")
+        pdf.set_y(y0 + h + 9)
+
     pdf = StyledPDF()
     pdf.add_page()
 
@@ -1205,6 +1279,12 @@ def _mr_build_pdf(report: dict) -> bytes:
         pdf.set_font("Helvetica", "B", 10)
         pdf.cell(45, 8.5, f"{arrow} {r['change_pct']:+.2f}%  ", 0, 1, "R", True)
         pdf.set_font("Helvetica", "", 10)
+
+    # ---- Nifty 50 trend chart ----
+    nifty_series = report.get("nifty_series") or []
+    if len(nifty_series) >= 2:
+        _section(pdf, "NIFTY 50 TREND")
+        _nifty_chart(pdf, nifty_series, tone_rgb)
 
     # ---- FII / DII activity ----
     fd = report.get("fii_dii")
@@ -1280,6 +1360,8 @@ def _mr_build_pdf(report: dict) -> bytes:
         else:
             pdf.ln(2)
     box_h = pdf.get_y() - box_y + 3
+    pdf.set_draw_color(*GOLD)
+    pdf.set_line_width(0.4)
     pdf.rect(10, box_y, 190, box_h, "D")
 
     return bytes(pdf.output())
@@ -1294,6 +1376,75 @@ def macro_report_pdf(period: str = "daily"):
         content=pdf_bytes, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="macro_report_{period}.pdf"'},
     )
+
+
+def _mr_send_email(report: dict, pdf_bytes: bytes, to_addr: str) -> None:
+    """Emails the Macro Report PDF via SMTP, reusing the app's existing
+    SMTP_USER / SMTP_PASSWORD / SMTP_FROM env vars (same credentials already
+    configured on Render for other email features). Optional SMTP_HOST /
+    SMTP_PORT override the Gmail default."""
+    import os, smtplib
+    from email.message import EmailMessage
+
+    login_user = os.environ.get("SMTP_USER")
+    password = os.environ.get("SMTP_PASSWORD")
+    sender = os.environ.get("SMTP_FROM") or login_user
+    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.environ.get("SMTP_PORT", "465"))
+    if not login_user or not password or not sender:
+        raise HTTPException(500, "Email is not configured (SMTP_USER / SMTP_PASSWORD / SMTP_FROM missing)")
+
+    top_news = (report.get("news") or [])[:3]
+    news_lines = "\n".join(f"  - {_mr_safe(n['title'])} ({_mr_safe(n['source'])}, {_mr_safe(n['age'])})"
+                           for n in top_news) or "  (no major headlines right now)"
+    fd = report.get("fii_dii") or {}
+    fd_line = (f"FII net Rs {fd['fii_net_total']:,.0f} cr | DII net Rs {fd['dii_net_total']:,.0f} cr"
+               if fd else "FII/DII data unavailable")
+
+    subject = f"Advantage - {report['period_label']} Market Report ({report.get('tone', 'N/A')}) - {report['generated_at']}"
+    body = f"""Your {report['period_label'].lower()} macro market report is attached.
+
+Overall tone: {report.get('tone', 'N/A')}
+{fd_line}
+
+Top headlines:
+{news_lines}
+
+Full snapshot, FII/DII activity, Nifty 50 trend chart, and AI commentary are in the attached PDF.
+This is an automated email from your Advantage app - not financial advice."""
+
+    msg = EmailMessage()
+    msg["Subject"] = _mr_safe(subject)
+    msg["From"] = sender
+    msg["To"] = to_addr
+    msg.set_content(body)
+    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf",
+                       filename=f"macro_report_{report['period']}.pdf")
+
+    with smtplib.SMTP_SSL(host, port) as smtp:
+        smtp.login(login_user, password)
+        smtp.send_message(msg)
+
+
+@app.get("/market/macro-report/email")
+def macro_report_email(period: str = "daily", token: str = "", to: str = ""):
+    """Builds the report + PDF and emails it - meant to be called by an
+    external scheduler (e.g. cron-job.org) on a daily/weekly/monthly cron.
+    Protected by a shared secret (CRON_SECRET) so it can't be triggered or
+    spammed by a random visitor hitting the URL."""
+    import os
+    expected = os.environ.get("CRON_SECRET")
+    if not expected or token != expected:
+        raise HTTPException(401, "Invalid or missing token")
+
+    to_addr = to or os.environ.get("EMAIL_RECIPIENT")
+    if not to_addr:
+        raise HTTPException(400, "No recipient - pass ?to= or set EMAIL_RECIPIENT")
+
+    report = _mr_build_report(period)
+    pdf_bytes = _mr_build_pdf(report)
+    _mr_send_email(report, pdf_bytes, to_addr)
+    return {"sent": True, "to": to_addr, "period": period, "tone": report.get("tone")}
 
 
 # =============================================================================
