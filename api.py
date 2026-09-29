@@ -1399,20 +1399,20 @@ def macro_report_pdf(period: str = "daily"):
 
 
 def _mr_send_email(report: dict, pdf_bytes: bytes, to_addr: str) -> None:
-    """Emails the Macro Report PDF via SMTP, reusing the app's existing
-    SMTP_USER / SMTP_PASSWORD / SMTP_FROM env vars (same credentials already
-    configured on Render for other email features). Optional SMTP_HOST /
-    SMTP_PORT override the Gmail default."""
-    import os, smtplib
-    from email.message import EmailMessage
+    """Emails the Macro Report PDF via Brevo's HTTP email API.
 
-    login_user = os.environ.get("SMTP_USER")
-    password = os.environ.get("SMTP_PASSWORD")
-    sender = os.environ.get("SMTP_FROM") or login_user
-    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.environ.get("SMTP_PORT", "465"))
-    if not login_user or not password or not sender:
-        raise HTTPException(500, "Email is not configured (SMTP_USER / SMTP_PASSWORD / SMTP_FROM missing)")
+    Render (like most cloud hosts) blocks outbound SMTP ports (465/587) on
+    its network, so a direct smtplib connection fails with
+    "OSError: Network is unreachable" no matter what credentials are used.
+    Brevo's API travels over normal HTTPS (port 443), which isn't blocked.
+    Requires env vars BREVO_API_KEY and EMAIL_SENDER (the sender address
+    must be a "verified sender" in your Brevo account)."""
+    import os, base64, requests
+
+    api_key = os.environ.get("BREVO_API_KEY")
+    sender = os.environ.get("EMAIL_SENDER") or os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER")
+    if not api_key or not sender:
+        raise HTTPException(500, "Email is not configured (BREVO_API_KEY / EMAIL_SENDER missing)")
 
     top_news = (report.get("news") or [])[:3]
     news_lines = "\n".join(f"  - {_mr_safe(n['title'])} ({_mr_safe(n['source'])}, {_mr_safe(n['age'])})"
@@ -1421,8 +1421,9 @@ def _mr_send_email(report: dict, pdf_bytes: bytes, to_addr: str) -> None:
     fd_line = (f"FII net Rs {fd['fii_net_total']:,.0f} cr | DII net Rs {fd['dii_net_total']:,.0f} cr"
                if fd else "FII/DII data unavailable")
 
-    subject = f"Advantage - {report['period_label']} Market Report ({report.get('tone', 'N/A')}) - {report['generated_at']}"
-    body = f"""Your {report['period_label'].lower()} macro market report is attached.
+    subject = _mr_safe(f"Advantage - {report['period_label']} Market Report "
+                       f"({report.get('tone', 'N/A')}) - {report['generated_at']}")
+    body = _mr_safe(f"""Your {report['period_label'].lower()} macro market report is attached.
 
 Overall tone: {report.get('tone', 'N/A')}
 {fd_line}
@@ -1431,19 +1432,25 @@ Top headlines:
 {news_lines}
 
 Full snapshot, FII/DII activity, Nifty 50 trend chart, and AI commentary are in the attached PDF.
-This is an automated email from your Advantage app - not financial advice."""
+This is an automated email from your Advantage app - not financial advice.""")
 
-    msg = EmailMessage()
-    msg["Subject"] = _mr_safe(subject)
-    msg["From"] = sender
-    msg["To"] = to_addr
-    msg.set_content(body)
-    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf",
-                       filename=f"macro_report_{report['period']}.pdf")
-
-    with smtplib.SMTP_SSL(host, port) as smtp:
-        smtp.login(login_user, password)
-        smtp.send_message(msg)
+    payload = {
+        "sender": {"email": sender, "name": "Advantage"},
+        "to": [{"email": to_addr}],
+        "subject": subject,
+        "textContent": body,
+        "attachment": [{
+            "content": base64.b64encode(pdf_bytes).decode("ascii"),
+            "name": f"macro_report_{report['period']}.pdf",
+        }],
+    }
+    r = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={"api-key": api_key, "Content-Type": "application/json", "accept": "application/json"},
+        json=payload, timeout=20,
+    )
+    if r.status_code >= 300:
+        raise HTTPException(502, f"Email send failed ({r.status_code}): {r.text[:300]}")
 
 
 @app.get("/market/macro-report/email")
