@@ -1084,6 +1084,24 @@ def macro_report(period: str = "daily"):
     return _clean(_mr_build_report(period))
 
 
+def _mr_safe(text) -> str:
+    """FPDF's core fonts (Helvetica etc.) only render latin-1. Real RSS
+    headlines and AI text can contain smart quotes, en-dashes, arrows, the
+    rupee sign, etc. that would otherwise crash PDF generation with a 500 -
+    normalise the common ones and drop anything else latin-1 can't encode."""
+    if text is None:
+        return ""
+    s = str(text)
+    _repl = {
+        "‘": "'", "’": "'", "“": '"', "”": '"',
+        "–": "-", "—": "-", "…": "...", "•": "-",
+        "▲": "^", "▼": "v", "₹": "Rs ", " ": " ",
+    }
+    for k, v in _repl.items():
+        s = s.replace(k, v)
+    return s.encode("latin-1", "ignore").decode("latin-1")
+
+
 def _mr_build_pdf(report: dict) -> bytes:
     from fpdf import FPDF
 
@@ -1120,7 +1138,7 @@ def _mr_build_pdf(report: dict) -> bytes:
             self.set_x(10)
             self.set_font("Helvetica", "", 8.5)
             self.set_text_color(200, 214, 220)
-            self.cell(0, 5, f"{report['period_label']} snapshot  -  generated {report['generated_at']}", ln=1)
+            self.cell(0, 5, _mr_safe(f"{report['period_label']} snapshot  -  generated {report['generated_at']}"), ln=1)
             # period badge, top-right
             self.set_font("Helvetica", "B", 9)
             badge_w = 26
@@ -1175,11 +1193,11 @@ def _mr_build_pdf(report: dict) -> bytes:
         up = r["change_pct"] >= 0
         chg_bg = LIGHT_GREEN_BG if up else LIGHT_RED_BG
         chg_color = GREEN if up else RED
-        arrow = "▲" if up else "▼"
+        arrow = "^" if up else "v"
 
         pdf.set_fill_color(*row_bg)
         pdf.set_text_color(*INK)
-        pdf.cell(80, 8.5, f"  {r['name']}", 0, 0, "L", True)
+        pdf.cell(80, 8.5, _mr_safe(f"  {r['name']}"), 0, 0, "L", True)
         pdf.cell(45, 8.5, f"{r['value']:,.2f}  ", 0, 0, "R", True)
 
         pdf.set_fill_color(*chg_bg)
@@ -1219,8 +1237,8 @@ def _mr_build_pdf(report: dict) -> bytes:
         pdf.set_y(y0 + 26)
         pdf.set_font("Helvetica", "I", 8.5)
         pdf.set_text_color(*GREY)
-        pdf.cell(0, 6, f"Over the available {fd['total_days']} trading day(s) of data  -  "
-                       f"{fd['fii_buying_days']} FII-buying day(s)", ln=1)
+        pdf.cell(0, 6, _mr_safe(f"Over the available {fd['total_days']} trading day(s) of data  -  "
+                       f"{fd['fii_buying_days']} FII-buying day(s)"), ln=1)
 
     # ---- News highlights (real headlines, not AI-written) ----
     news = report.get("news") or []
@@ -1235,11 +1253,11 @@ def _mr_build_pdf(report: dict) -> bytes:
             pdf.set_x(14)
             pdf.set_font("Helvetica", "B", 9.5)
             pdf.set_text_color(*INK)
-            pdf.multi_cell(150, 5, n["title"])
+            pdf.multi_cell(150, 5, _mr_safe(n["title"]))
             pdf.set_x(14)
             pdf.set_font("Helvetica", "", 8)
             pdf.set_text_color(*GREY)
-            pdf.cell(0, 4.5, f"{n['source']}  -  {n['age']}  -  {n['impact']} impact, {n['sentiment']}", ln=1)
+            pdf.cell(0, 4.5, _mr_safe(f"{n['source']}  -  {n['age']}  -  {n['impact']} impact, {n['sentiment']}"), ln=1)
             pdf.ln(1.5)
 
     # ---- AI analysis ----
@@ -1250,7 +1268,7 @@ def _mr_build_pdf(report: dict) -> bytes:
     pdf.set_text_color(*INK)
     lines_out = []
     for line in report["ai_summary"].split("\n"):
-        clean_line = line.replace("**", "").strip()
+        clean_line = _mr_safe(line.replace("**", "").strip())
         lines_out.append((clean_line, line.strip().startswith("**")))
     # estimate box height then draw background, then redraw text on top
     pdf.set_xy(14, box_y + 3)
