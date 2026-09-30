@@ -3274,8 +3274,32 @@ def get_expense_summary(email: str, month: Optional[str] = None):
         day = str(r.get("expense_date"))
         by_day[day] = by_day.get(day, 0) + amt
 
+    # How many calendar days to average over: if a specific month was
+    # requested, use the number of days elapsed in that month (full month
+    # if it's a past month, up-to-today if it's the current month);
+    # otherwise fall back to the number of distinct days with any spend.
+    from datetime import date as _date
+    days_for_average = len(by_day)
+    if month:
+        try:
+            y, m = (int(x) for x in month.split("-"))
+            today = _date.today()
+            if (y, m) == (today.year, today.month):
+                days_for_average = today.day
+            else:
+                # days in that month
+                next_m = _date(y + 1, 1, 1) if m == 12 else _date(y, m + 1, 1)
+                days_for_average = (next_m - _date(y, m, 1)).days
+        except ValueError:
+            pass
+    days_for_average = max(1, days_for_average)
+
     return _clean({
         "total": round(total, 2),
+        # Aliases the Flutter app's Spending tab reads directly.
+        "total_spent": round(total, 2),
+        "average_daily_spend": round(total / days_for_average, 2),
+        "transaction_count": len(rows),
         "month": month,
         "by_category": [{"category": k, "amount": round(v, 2)}
                         for k, v in sorted(by_cat.items(), key=lambda x: -x[1])],
