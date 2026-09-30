@@ -3393,6 +3393,8 @@ def get_loans(email: str):
         months = int(r.get("tenure_months") or 0)
         emi = _emi(principal, rate, months)
         r["monthly_emi"] = emi
+        # Alias the Flutter app's Loans & Debt tab reads directly.
+        r["emi"] = emi
 
         # months_elapsed: the app's Loans tab uses this (vs tenure_months)
         # to show repayment progress - not stored, computed from start_date.
@@ -3410,13 +3412,39 @@ def get_loans(email: str):
                 months_elapsed = 0
         r["months_elapsed"] = months_elapsed
 
-        total_debt += principal
-        total_emi += emi
+        months_paid = min(months_elapsed, months) if months > 0 else 0
+        months_remaining = max(0, months - months_elapsed)
+        r["months_remaining"] = months_remaining
+        r["is_paid_off"] = months > 0 and months_elapsed >= months
+
+        # Remaining principal balance under standard reducing-balance
+        # amortization, after `months_paid` EMIs have been paid.
+        if r["is_paid_off"] or principal <= 0 or months <= 0:
+            outstanding_balance = 0.0
+        else:
+            monthly_rate = rate / 12 / 100
+            if monthly_rate == 0:
+                outstanding_balance = max(0.0, principal - emi * months_paid)
+            else:
+                factor_paid = (1 + monthly_rate) ** months_paid
+                outstanding_balance = max(
+                    0.0, principal * factor_paid - emi *
+                    ((factor_paid - 1) / monthly_rate))
+        r["outstanding_balance"] = round(outstanding_balance, 2)
+
+        total_debt += r["outstanding_balance"]
+        total_emi += 0 if r["is_paid_off"] else emi
+
+    active_loan_count = sum(1 for r in rows if not r.get("is_paid_off"))
+    paid_off_count = sum(1 for r in rows if r.get("is_paid_off"))
 
     return _clean({
         "loans": rows,
         "total_outstanding_debt": round(total_debt, 2),
         "total_monthly_emi": round(total_emi, 2),
+        # Aliases the Flutter app's Loans & Debt tab reads directly.
+        "active_loan_count": active_loan_count,
+        "paid_off_count": paid_off_count,
     })
 
 
