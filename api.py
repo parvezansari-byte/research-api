@@ -1458,20 +1458,46 @@ def macro_report_email(period: str = "daily", token: str = "", to: str = ""):
     """Builds the report + PDF and emails it - meant to be called by an
     external scheduler (e.g. cron-job.org) on a daily/weekly/monthly cron.
     Protected by a shared secret (CRON_SECRET) so it can't be triggered or
-    spammed by a random visitor hitting the URL."""
+    spammed by a random visitor hitting the URL.
+
+    With no ?to=, sends to every user who has opted in to this period via
+    the alert-settings toggle in the app (plus EMAIL_RECIPIENT as a fallback,
+    for admin/testing). With ?to=, sends only to that one address."""
     import os
     expected = os.environ.get("CRON_SECRET")
     if not expected or token != expected:
         raise HTTPException(401, "Invalid or missing token")
 
-    to_addr = to or os.environ.get("EMAIL_RECIPIENT")
-    if not to_addr:
-        raise HTTPException(400, "No recipient - pass ?to= or set EMAIL_RECIPIENT")
+    period = period.lower()
+    if period not in _MR_PERIOD_CONFIG:
+        raise HTTPException(400, "period must be daily, weekly, or monthly")
+
+    if to:
+        recipients = [to]
+    else:
+        recipients = _mr_opted_in_emails(period)
+        fallback = os.environ.get("EMAIL_RECIPIENT")
+        if fallback and fallback not in recipients:
+            recipients.append(fallback)
+
+    if not recipients:
+        return {"sent": False, "reason": "No opted-in recipients for this period",
+                "period": period}
 
     report = _mr_build_report(period)
     pdf_bytes = _mr_build_pdf(report)
-    _mr_send_email(report, pdf_bytes, to_addr)
-    return {"sent": True, "to": to_addr, "period": period, "tone": report.get("tone")}
+
+    results = []
+    for addr in recipients:
+        try:
+            _mr_send_email(report, pdf_bytes, addr)
+            results.append({"to": addr, "ok": True})
+        except Exception as e:
+            results.append({"to": addr, "ok": False, "error": str(e)})
+
+    return {"sent": True, "period": period, "tone": report.get("tone"), "recipients": results}
+
+
 
 
 # =============================================================================
@@ -2872,6 +2898,257 @@ def signup(req: AuthRequest):
         raise HTTPException(502, f"Could not create account: {e}")
 
     return {"email": email, "name": req.name or email.split("@")[0].title()}
+
+
+# ===========================================================================
+# ALERT SETTINGS  (per-user opt-in for Daily/Weekly/Monthly report emails)
+# ===========================================================================
+class AlertSettingsRequest(BaseModel):
+    daily: bool = False
+    weekly: bool = False
+    monthly: bool = False
+
+
+@app.get("/alerts/{email}")
+def get_alert_settings(email: str):
+    """Current opt-in state for a user's macro-report email alerts.
+    Defaults to all-off if the user has never set a preference."""
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        res = sb.table("alert_settings").select("*").eq("user_email", email).execute()
+        rec = res.data[0] if res.data else None
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {
+        "email": email,
+        "daily": bool(rec.get("daily")) if rec else False,
+        "weekly": bool(rec.get("weekly")) if rec else False,
+        "monthly": bool(rec.get("monthly")) if rec else False,
+    }
+
+
+@app.post("/alerts/{email}")
+def set_alert_settings(email: str, req: AlertSettingsRequest):
+    """Save a user's opt-in state for Daily/Weekly/Monthly macro-report emails."""
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = email.strip().lower()
+    try:
+        sb.table("alert_settings").upsert({
+            "user_email": email,
+            "daily": req.daily,
+            "weekly": req.weekly,
+            "monthly": req.monthly,
+        }, on_conflict="user_email").execute()
+    except Exception as e:
+        raise HTTPException(502, f"Could not save alert settings: {e}")
+    return {"email": email, "daily": req.daily, "weekly": req.weekly, "monthly": req.monthly}
+
+
+def _mr_opted_in_emails(period: str) -> list:
+    """All user emails currently opted in to this period's macro-report email."""
+    sb = _supabase()
+    if sb is None:
+        return []
+    try:
+        res = sb.table("alert_settings").select("user_email").eq(period, True).execute()
+        return [r["user_email"] for r in (res.data or []) if r.get("user_email")]
+    except Exception:
+        return []
+
+
+# ===========================================================================
+# EMAIL-OTP  (signup verification + password reset)
+# ===========================================================================
+def _gen_otp() -> str:
+    import random, string
+    return "".join(random.choices(string.digits, k=6))
+
+
+def _send_plain_email(to_addr: str, subject: str, body: str) -> None:
+    """Plain-text email via Brevo's HTTP API - same setup as the macro-report
+    emails (BREVO_API_KEY / EMAIL_SENDER), just without a PDF attachment."""
+    import os, requests
+    api_key = os.environ.get("BREVO_API_KEY")
+    sender = os.environ.get("EMAIL_SENDER") or os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER")
+    if not api_key or not sender:
+        raise HTTPException(500, "Email is not configured (BREVO_API_KEY / EMAIL_SENDER missing)")
+    payload = {
+        "sender": {"email": sender, "name": "Advantage"},
+        "to": [{"email": to_addr}],
+        "subject": subject,
+        "textContent": body,
+    }
+    r = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={"api-key": api_key, "Content-Type": "application/json", "accept": "application/json"},
+        json=payload, timeout=20,
+    )
+    if r.status_code >= 300:
+        raise HTTPException(502, f"Email send failed ({r.status_code}): {r.text[:300]}")
+
+
+def _otp_store(sb, email: str, purpose: str, code: str, ttl_minutes: int = 10) -> None:
+    from datetime import datetime, timedelta, timezone
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)).isoformat()
+    # Clear any previous code for this email+purpose so only the newest is valid.
+    sb.table("otp_codes").delete().eq("email", email).eq("purpose", purpose).execute()
+    sb.table("otp_codes").insert({
+        "email": email, "purpose": purpose, "code": code, "expires_at": expires_at,
+    }).execute()
+
+
+def _otp_check(sb, email: str, purpose: str, code: str) -> bool:
+    from datetime import datetime, timezone
+    res = (sb.table("otp_codes").select("*")
+           .eq("email", email).eq("purpose", purpose).eq("code", code).execute())
+    if not res.data:
+        return False
+    expires_at = res.data[0].get("expires_at")
+    try:
+        exp = (datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+               if isinstance(expires_at, str) else expires_at)
+    except Exception:
+        return False
+    return datetime.now(timezone.utc) <= exp
+
+
+def _otp_clear(sb, email: str, purpose: str) -> None:
+    sb.table("otp_codes").delete().eq("email", email).eq("purpose", purpose).execute()
+
+
+class EmailOnlyRequest(BaseModel):
+    email: str
+
+
+class SignupVerifyRequest(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
+    code: str
+
+
+class ResetVerifyRequest(BaseModel):
+    email: str
+    code: str
+    new_password: str
+
+
+@app.post("/auth/signup/request-otp")
+def signup_request_otp(req: EmailOnlyRequest):
+    """Emails a 6-digit verification code so signup can confirm the address
+    is real before creating the account."""
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = req.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(400, "Enter a valid email")
+    try:
+        existing = sb.table("users").select("email").eq("email", email).execute()
+        if existing.data:
+            raise HTTPException(409, "An account with this email already exists")
+        code = _gen_otp()
+        _otp_store(sb, email, "signup", code)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Could not generate code: {e}")
+
+    _send_plain_email(
+        email, "Your Advantage verification code",
+        f"Your verification code is {code}. It expires in 10 minutes.\n\n"
+        "If you didn't request this, you can ignore this email.",
+    )
+    return {"sent": True}
+
+
+@app.post("/auth/signup/verify")
+def signup_verify(req: SignupVerifyRequest):
+    """Checks the emailed code and, if valid, creates the account (same as
+    /auth/signup, but only after email ownership is confirmed)."""
+    import bcrypt
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = req.email.strip().lower()
+    if len(req.password) < 6:
+        raise HTTPException(400, "Password must be 6+ characters")
+
+    try:
+        if not _otp_check(sb, email, "signup", req.code.strip()):
+            raise HTTPException(400, "That code is invalid or has expired")
+        existing = sb.table("users").select("email").eq("email", email).execute()
+        if existing.data:
+            raise HTTPException(409, "An account with this email already exists")
+
+        name = req.name or email.split("@")[0].title()
+        pw_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+        sb.table("users").insert({
+            "email": email, "password_hash": pw_hash, "name": name,
+        }).execute()
+        _otp_clear(sb, email, "signup")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Could not create account: {e}")
+
+    return {"email": email, "name": name}
+
+
+@app.post("/auth/reset/request-otp")
+def reset_request_otp(req: EmailOnlyRequest):
+    """Emails a 6-digit password-reset code, if the address has an account.
+    Always returns success either way, so a visitor can't use this to probe
+    which emails are registered."""
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = req.email.strip().lower()
+    try:
+        existing = sb.table("users").select("email").eq("email", email).execute()
+        if not existing.data:
+            return {"sent": True}
+        code = _gen_otp()
+        _otp_store(sb, email, "reset", code)
+    except Exception as e:
+        raise HTTPException(502, f"Could not generate code: {e}")
+
+    _send_plain_email(
+        email, "Your Advantage password reset code",
+        f"Your password reset code is {code}. It expires in 10 minutes.\n\n"
+        "If you didn't request this, you can ignore this email.",
+    )
+    return {"sent": True}
+
+
+@app.post("/auth/reset/verify")
+def reset_verify(req: ResetVerifyRequest):
+    """Checks the emailed reset code and, if valid, sets the new password."""
+    import bcrypt
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    email = req.email.strip().lower()
+    if len(req.new_password) < 6:
+        raise HTTPException(400, "Password must be 6+ characters")
+
+    try:
+        if not _otp_check(sb, email, "reset", req.code.strip()):
+            raise HTTPException(400, "That code is invalid or has expired")
+        pw_hash = bcrypt.hashpw(req.new_password.encode(), bcrypt.gensalt()).decode()
+        sb.table("users").update({"password_hash": pw_hash}).eq("email", email).execute()
+        _otp_clear(sb, email, "reset")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Could not reset password: {e}")
+
+    return {"reset": True}
 
 
 # ===========================================================================
