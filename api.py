@@ -4282,3 +4282,133 @@ def trading_cancel_order(owner_email: str, req: DhanCancelOrderRequest):
     except Exception as e:
         raise HTTPException(502, f"Dhan error: {e}")
     return _clean(result)
+
+
+# ---------------------------------------------------------------------------
+# OPTION CHAIN (Dhan) - public market data, no owner scoping needed.
+# Backs the app's Option Chain / Chart & Options screens, which previously
+# pointed at these URLs with nothing behind them.
+# ---------------------------------------------------------------------------
+
+def _resolve_index_security_id(index: str):
+    from dhanhq_api import DhanAPIError
+    client = _dhan_client()
+    try:
+        return client, client.get_index_security_id(index)
+    except DhanAPIError as e:
+        raise HTTPException(404, str(e))
+
+
+def _max_pain(rows: list):
+    """Strike at which option writers, in aggregate, pay out the least."""
+    if not rows:
+        return None
+    best_strike = None
+    best_payout = None
+    for candidate in (r["strike"] for r in rows):
+        payout = 0.0
+        for r in rows:
+            if candidate > r["strike"]:
+                payout += (candidate - r["strike"]) * r["ce_oi"]
+            if candidate < r["strike"]:
+                payout += (r["strike"] - candidate) * r["pe_oi"]
+        if best_payout is None or payout < best_payout:
+            best_payout = payout
+            best_strike = candidate
+    return best_strike
+
+
+def _build_option_chain(raw: dict, strikes: int) -> dict:
+    spot = float(raw.get("last_price") or 0)
+    oc = raw.get("oc") or {}
+
+    all_rows = []
+    for strike_str, legs in oc.items():
+        try:
+            strike = float(strike_str)
+        except (TypeError, ValueError):
+            continue
+        ce = legs.get("ce") or {}
+        pe = legs.get("pe") or {}
+        all_rows.append({
+            "strike": strike,
+            "ce_oi": ce.get("oi") or 0,
+            "ce_ltp": ce.get("last_price") or 0,
+            "pe_oi": pe.get("oi") or 0,
+            "pe_ltp": pe.get("last_price") or 0,
+        })
+    all_rows.sort(key=lambda r: r["strike"])
+
+    if not all_rows:
+        return {
+            "spot": spot, "pcr": 0, "max_pain": None, "atm": None,
+            "support": None, "resistance": None,
+            "signal": "No option data available for this expiry",
+            "total_pe_oi": 0, "total_ce_oi": 0, "rows": [],
+        }
+
+    atm_row = min(all_rows, key=lambda r: abs(r["strike"] - spot))
+    atm_idx = all_rows.index(atm_row)
+    lo = max(0, atm_idx - strikes)
+    hi = min(len(all_rows), atm_idx + strikes + 1)
+    rows = all_rows[lo:hi]
+
+    total_ce_oi = sum(r["ce_oi"] for r in all_rows)
+    total_pe_oi = sum(r["pe_oi"] for r in all_rows)
+    pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi else 0
+
+    support = max(all_rows, key=lambda r: r["pe_oi"])["strike"]
+    resistance = max(all_rows, key=lambda r: r["ce_oi"])["strike"]
+
+    if pcr > 1.0:
+        signal = "Put writers dominate — leans supportive"
+    elif pcr > 0.7:
+        signal = "Balanced positioning between calls and puts"
+    else:
+        signal = "Call writers dominate — leans resistant"
+
+    return {
+        "spot": spot,
+        "pcr": pcr,
+        "max_pain": _max_pain(all_rows),
+        "atm": atm_row["strike"],
+        "support": support,
+        "resistance": resistance,
+        "signal": signal,
+        "total_pe_oi": total_pe_oi,
+        "total_ce_oi": total_ce_oi,
+        "rows": rows,
+    }
+
+
+@app.get("/options/expiries")
+def options_expiries(index: str):
+    from dhanhq_api import DhanAPIError
+    client, sec_id = _resolve_index_security_id(index)
+    try:
+        expiries = client.get_option_expiries(sec_id)
+    except DhanAPIError as e:
+        raise HTTPException(502, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Could not load expiries: {e}")
+    return {"expiries": expiries}
+
+
+@app.get("/options/chain")
+def options_chain(index: str, expiry: str = "", strikes: int = 10):
+    from dhanhq_api import DhanAPIError
+    client, sec_id = _resolve_index_security_id(index)
+    try:
+        if not expiry:
+            expiries = client.get_option_expiries(sec_id)
+            if not expiries:
+                raise HTTPException(404, f"No option expiries available for {index}")
+            expiry = expiries[0]
+        raw = client.get_option_chain(sec_id, expiry)
+    except HTTPException:
+        raise
+    except DhanAPIError as e:
+        raise HTTPException(502, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Could not load option chain: {e}")
+    return _clean(_build_option_chain(raw, max(1, min(strikes, 40))))

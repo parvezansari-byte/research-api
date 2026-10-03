@@ -152,6 +152,77 @@ class DhanAPI:
 
         return str(rows.iloc[0][id_col])
 
+    # Our app's display names for the indices the option-chain screen
+    # offers, mapped to the various spellings Dhan's scrip master uses
+    # for the same index (this has drifted across CSV releases, so we
+    # try several candidates rather than hardcoding one security id that
+    # could go stale).
+    _INDEX_ALIASES = {
+        "NIFTY 50": ["NIFTY 50", "NIFTY"],
+        "BANK NIFTY": ["NIFTY BANK", "BANKNIFTY", "BANK NIFTY"],
+        "FIN NIFTY": ["NIFTY FIN SERVICE", "FINNIFTY", "NIFTY FINANCIAL SERVICES"],
+        "MIDCAP NIFTY": ["NIFTY MIDCAP SELECT", "MIDCPNIFTY"],
+    }
+
+    def get_index_security_id(self, display_name: str) -> str:
+        """
+        Resolve one of our index display names ('NIFTY 50', 'BANK NIFTY',
+        'FIN NIFTY', 'MIDCAP NIFTY') to Dhan's numeric security_id for
+        that index, by matching against the scrip master's own index rows
+        rather than a hardcoded id that could go stale.
+        """
+        df = self._load_scrip_master()
+        key = display_name.strip().upper()
+        candidates = [c.upper() for c in self._INDEX_ALIASES.get(key, [key])]
+
+        sym_cols = [c for c in ("SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL")
+                    if c in df.columns]
+        id_col = "SEM_SMST_SECURITY_ID"
+        instr_col = ("SEM_INSTRUMENT_NAME" if "SEM_INSTRUMENT_NAME" in df.columns
+                     else None)
+
+        for col in sym_cols:
+            vals = df[col].astype(str).str.upper().str.strip()
+            mask = vals.isin(candidates)
+            if not mask.any():
+                continue
+            if instr_col:
+                idx_mask = mask & (
+                    df[instr_col].astype(str).str.upper() == "INDEX")
+                if idx_mask.any():
+                    return str(df[idx_mask].iloc[0][id_col])
+            return str(df[mask].iloc[0][id_col])
+
+        raise DhanAPIError(
+            f"Could not find index '{display_name}' in Dhan's instrument list")
+
+    # ------------------------------------------------------------------ #
+    # Options
+    # ------------------------------------------------------------------ #
+    def get_option_expiries(self, under_security_id,
+                             under_exchange_segment: str = "IDX_I") -> list:
+        """All available expiry dates for an underlying (index or stock)."""
+        resp = self.dhan.expiry_list(
+            under_security_id=int(under_security_id),
+            under_exchange_segment=under_exchange_segment,
+        )
+        data = self._unwrap(resp, "get_option_expiries")
+        return list(data or [])
+
+    def get_option_chain(self, under_security_id, expiry: str,
+                          under_exchange_segment: str = "IDX_I") -> dict:
+        """
+        Raw option chain for one expiry: {'last_price': ..., 'oc': {strike:
+        {'ce': {...}, 'pe': {...}}, ...}}. Dhan rate-limits this endpoint to
+        one request every 3 seconds per the API docs.
+        """
+        resp = self.dhan.option_chain(
+            under_security_id=int(under_security_id),
+            under_exchange_segment=under_exchange_segment,
+            expiry=expiry,
+        )
+        return self._unwrap(resp, "get_option_chain")
+
     # ------------------------------------------------------------------ #
     # Account / portfolio
     # ------------------------------------------------------------------ #
