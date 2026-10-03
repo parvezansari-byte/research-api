@@ -97,11 +97,21 @@ class DhanAPI:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _unwrap(resp: dict, what: str = "request"):
-        """Dhan responses look like {'status': 'success', 'data': ...}."""
-        if isinstance(resp, dict) and resp.get("status") == "failure":
-            raise DhanAPIError(f"{what} failed: {resp.get('remarks') or resp}")
-        if isinstance(resp, dict) and "data" in resp:
-            return resp["data"]
+        """
+        Dhan responses look like {'status': 'success', 'data': ...}. For
+        most endpoints that's a single envelope. But a few endpoints
+        (option chain, expiry list) return Dhan's own {'data', 'status'}
+        JSON body as the *payload* of the SDK's own {'status', 'remarks',
+        'data'} HTTP wrapper - a double envelope. Peel every layer that
+        looks like an envelope (has both 'status' and 'data' keys) so
+        callers always get the real payload, not another wrapper dict.
+        """
+        seen = 0
+        while isinstance(resp, dict) and "status" in resp and "data" in resp and seen < 4:
+            if resp.get("status") == "failure":
+                raise DhanAPIError(f"{what} failed: {resp.get('remarks') or resp}")
+            resp = resp["data"]
+            seen += 1
         return resp
 
     def _load_scrip_master(self, force: bool = False) -> pd.DataFrame:
