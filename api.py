@@ -3872,3 +3872,413 @@ Rules: use ONLY the data above; invent no numbers or news. Never say whether to 
         return {"analysis": (resp.text or "").strip()}
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")
+
+
+# ===========================================================================
+# CRM  (distributor back-office: client records, interaction notes, and a
+# cached snapshot of each client's mutual fund holdings pulled from NSE).
+# All records are scoped to `owner_email` - the distributor/advisor who
+# created them - so the same backend can support more than one advisor later
+# without any client ever seeing another advisor's book.
+# ===========================================================================
+class CrmClientRequest(BaseModel):
+    full_name: str
+    pan: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    date_of_birth: Optional[str] = None  # 'YYYY-MM-DD'
+    nse_client_code: Optional[str] = None
+    kyc_status: str = "PENDING"
+    risk_profile: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class CrmClientUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    nse_client_code: Optional[str] = None
+    kyc_status: Optional[str] = None
+    risk_profile: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class CrmInteractionRequest(BaseModel):
+    note: str
+
+
+@app.get("/crm/{owner_email}/clients")
+def crm_list_clients(owner_email: str, search: Optional[str] = None):
+    """All clients for this advisor, optionally filtered by name/PAN/email
+    substring (case-insensitive) via ?search=."""
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    owner_email = owner_email.strip().lower()
+    try:
+        q = sb.table("crm_clients").select("*").eq("owner_email", owner_email)
+        res = q.order("full_name").execute()
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+
+    rows = res.data or []
+    if search:
+        s = search.strip().lower()
+        rows = [
+            r for r in rows
+            if s in (r.get("full_name") or "").lower()
+            or s in (r.get("pan") or "").lower()
+            or s in (r.get("email") or "").lower()
+        ]
+    return {"clients": rows}
+
+
+@app.get("/crm/{owner_email}/clients/{client_id}")
+def crm_get_client(owner_email: str, client_id: int):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    owner_email = owner_email.strip().lower()
+    try:
+        res = (sb.table("crm_clients").select("*")
+               .eq("id", client_id).eq("owner_email", owner_email).execute())
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    if not res.data:
+        raise HTTPException(404, "Client not found")
+    return res.data[0]
+
+
+@app.post("/crm/{owner_email}/clients")
+def crm_add_client(owner_email: str, req: CrmClientRequest):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    owner_email = owner_email.strip().lower()
+    pan = req.pan.strip().upper()
+    if not pan:
+        raise HTTPException(400, "PAN is required")
+    try:
+        existing = (sb.table("crm_clients").select("id")
+                    .eq("owner_email", owner_email).eq("pan", pan).execute())
+        if existing.data:
+            raise HTTPException(409, "A client with this PAN already exists")
+        res = sb.table("crm_clients").insert({
+            "owner_email": owner_email,
+            "full_name": req.full_name.strip(),
+            "pan": pan,
+            "email": req.email,
+            "phone": req.phone,
+            "date_of_birth": req.date_of_birth,
+            "nse_client_code": req.nse_client_code,
+            "kyc_status": req.kyc_status,
+            "risk_profile": req.risk_profile,
+            "notes": req.notes,
+        }).execute()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Could not add client: {e}")
+    return res.data[0] if res.data else {"ok": True}
+
+
+@app.put("/crm/{owner_email}/clients/{client_id}")
+def crm_update_client(owner_email: str, client_id: int, req: CrmClientUpdateRequest):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    owner_email = owner_email.strip().lower()
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+    updates["updated_at"] = "now()"
+    try:
+        res = (sb.table("crm_clients").update(updates)
+               .eq("id", client_id).eq("owner_email", owner_email).execute())
+    except Exception as e:
+        raise HTTPException(502, f"Could not update client: {e}")
+    if not res.data:
+        raise HTTPException(404, "Client not found")
+    return res.data[0]
+
+
+@app.delete("/crm/{owner_email}/clients/{client_id}")
+def crm_delete_client(owner_email: str, client_id: int):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    owner_email = owner_email.strip().lower()
+    try:
+        sb.table("crm_clients").delete().eq("id", client_id).eq(
+            "owner_email", owner_email).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Could not delete client: {e}")
+    return {"ok": True}
+
+
+# ---- Interactions (notes/call log per client) ----
+@app.get("/crm/{owner_email}/clients/{client_id}/interactions")
+def crm_list_interactions(owner_email: str, client_id: int):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    owner_email = owner_email.strip().lower()
+    try:
+        res = (sb.table("crm_client_interactions").select("*")
+               .eq("client_id", client_id).eq("owner_email", owner_email)
+               .order("created_at", desc=True).execute())
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+    return {"interactions": res.data or []}
+
+
+@app.post("/crm/{owner_email}/clients/{client_id}/interactions")
+def crm_add_interaction(owner_email: str, client_id: int, req: CrmInteractionRequest):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    owner_email = owner_email.strip().lower()
+    note = req.note.strip()
+    if not note:
+        raise HTTPException(400, "Note can't be empty")
+    try:
+        owned = (sb.table("crm_clients").select("id")
+                 .eq("id", client_id).eq("owner_email", owner_email).execute())
+        if not owned.data:
+            raise HTTPException(404, "Client not found")
+        res = sb.table("crm_client_interactions").insert({
+            "client_id": client_id,
+            "owner_email": owner_email,
+            "note": note,
+        }).execute()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Could not add interaction: {e}")
+    return res.data[0] if res.data else {"ok": True}
+
+
+# ---- Holdings (cached snapshot; populated by the NSE sync job once that's
+# wired up - see crm_get_holdings for the shape the CRM app reads) ----
+@app.get("/crm/{owner_email}/clients/{client_id}/holdings")
+def crm_get_holdings(owner_email: str, client_id: int):
+    sb = _supabase()
+    if sb is None:
+        raise HTTPException(500, "Database not configured on the server")
+    owner_email = owner_email.strip().lower()
+    try:
+        owned = (sb.table("crm_clients").select("id")
+                 .eq("id", client_id).eq("owner_email", owner_email).execute())
+        if not owned.data:
+            raise HTTPException(404, "Client not found")
+        res = (sb.table("crm_client_holdings").select("*")
+               .eq("client_id", client_id)
+               .order("fetched_at", desc=True).execute())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Database error: {e}")
+
+    rows = res.data or []
+    total_value = sum(float(r.get("current_value") or 0) for r in rows)
+    last_fetched = rows[0]["fetched_at"] if rows else None
+    return _clean({
+        "holdings": rows,
+        "total_value": round(total_value, 2),
+        "last_fetched": last_fetched,
+    })
+
+
+# ===========================================================================
+# TRADING (Dhan)
+# ===========================================================================
+# Personal stock/F&O trading via your own Dhan account, reusing the
+# dhanhq_api.py wrapper already in this codebase (get_dhan_client(), which
+# reads DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN from the environment - the same
+# credentials already used for live price lookups elsewhere in this file).
+#
+# This is NOT a client/distributor feature - it's your single personal Dhan
+# account. There is no automated/algo decision-making here: every order is
+# something a human explicitly submits from the app, after confirming it.
+#
+# Optional environment variable:
+#   TRADING_OWNER_EMAIL - if set, only this email may call /trading/
+#                         endpoints, so a stranger who finds the URL can't
+#                         place orders against your Dhan account.
+def _require_trading_owner(owner_email: str):
+    import os
+    allowed = os.environ.get("TRADING_OWNER_EMAIL", "").strip().lower()
+    if allowed and owner_email.strip().lower() != allowed:
+        raise HTTPException(403, "Not authorized to use trading on this account")
+
+
+def _dhan_client():
+    from dhanhq_api import get_dhan_client
+    client = get_dhan_client()
+    if client is None:
+        raise HTTPException(
+            500,
+            "Dhan credentials are not configured on the server "
+            "(DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN)",
+        )
+    return client
+
+
+_EXCHANGE_SEGMENT = {"NSE": "NSE_EQ", "BSE": "BSE_EQ", "NSE_FNO": "NSE_FNO"}
+
+
+def _segment_for(exchange: str) -> str:
+    return _EXCHANGE_SEGMENT.get(exchange.strip().upper(), "NSE_EQ")
+
+
+class DhanOrderRequest(BaseModel):
+    trading_symbol: str
+    quantity: int
+    transaction_type: str  # BUY / SELL
+    order_type: str = "MARKET"  # MARKET / LIMIT / STOP_LOSS / STOP_LOSS_MARKET
+    product_type: str = "CNC"  # CNC / INTRADAY / MARGIN
+    exchange: str = "NSE"
+    price: float = 0
+    trigger_price: float = 0
+    validity: str = "DAY"
+
+
+class DhanModifyOrderRequest(BaseModel):
+    order_id: str
+    order_type: str
+    quantity: int
+    price: float
+    trigger_price: float = 0
+    validity: str = "DAY"
+
+
+class DhanCancelOrderRequest(BaseModel):
+    order_id: str
+
+
+@app.get("/trading/{owner_email}/funds")
+def trading_funds(owner_email: str):
+    _require_trading_owner(owner_email)
+    try:
+        return _clean(_dhan_client().get_funds())
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+
+
+@app.get("/trading/{owner_email}/holdings")
+def trading_holdings(owner_email: str):
+    _require_trading_owner(owner_email)
+    try:
+        return _clean({"holdings": _dhan_client().get_holdings()})
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+
+
+@app.get("/trading/{owner_email}/positions")
+def trading_positions(owner_email: str):
+    _require_trading_owner(owner_email)
+    try:
+        return _clean({"positions": _dhan_client().get_positions()})
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+
+
+@app.get("/trading/{owner_email}/trades")
+def trading_trades(owner_email: str):
+    _require_trading_owner(owner_email)
+    try:
+        return _clean({"trades": _dhan_client().get_trade_book()})
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+
+
+@app.get("/trading/{owner_email}/orders")
+def trading_list_orders(owner_email: str):
+    _require_trading_owner(owner_email)
+    try:
+        return _clean({"orders": _dhan_client().get_orders()})
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+
+
+@app.get("/trading/{owner_email}/order/{order_id}/status")
+def trading_order_status(owner_email: str, order_id: str):
+    _require_trading_owner(owner_email)
+    try:
+        return _clean(_dhan_client().get_order_status(order_id))
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+
+
+@app.get("/trading/{owner_email}/ltp")
+def trading_ltp(owner_email: str, symbol: str, exchange: str = "NSE"):
+    _require_trading_owner(owner_email)
+    client = _dhan_client()
+    try:
+        security_id = client.get_security_id(symbol, exchange)
+        price = client.get_ltp(security_id, _segment_for(exchange))
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+    return {"symbol": symbol.upper(), "security_id": security_id, "ltp": price}
+
+
+@app.get("/trading/{owner_email}/quote")
+def trading_quote(owner_email: str, symbol: str, exchange: str = "NSE"):
+    _require_trading_owner(owner_email)
+    client = _dhan_client()
+    try:
+        security_id = client.get_security_id(symbol, exchange)
+        quote = client.get_quote(security_id, _segment_for(exchange))
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+    return _clean(quote)
+
+
+@app.post("/trading/{owner_email}/order")
+def trading_place_order(owner_email: str, req: DhanOrderRequest):
+    _require_trading_owner(owner_email)
+    client = _dhan_client()
+    try:
+        security_id = client.get_security_id(req.trading_symbol, req.exchange)
+        result = client.place_order(
+            security_id=security_id,
+            transaction_type=req.transaction_type.upper(),
+            quantity=req.quantity,
+            order_type=req.order_type.upper(),
+            product_type=req.product_type.upper(),
+            price=req.price,
+            trigger_price=req.trigger_price,
+            exchange_segment=_segment_for(req.exchange),
+            validity=req.validity.upper(),
+        )
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+    return _clean(result)
+
+
+@app.put("/trading/{owner_email}/order")
+def trading_modify_order(owner_email: str, req: DhanModifyOrderRequest):
+    _require_trading_owner(owner_email)
+    try:
+        result = _dhan_client().modify_order(
+            order_id=req.order_id,
+            order_type=req.order_type.upper(),
+            quantity=req.quantity,
+            price=req.price,
+            trigger_price=req.trigger_price,
+            validity=req.validity.upper(),
+        )
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+    return _clean(result)
+
+
+@app.post("/trading/{owner_email}/order/cancel")
+def trading_cancel_order(owner_email: str, req: DhanCancelOrderRequest):
+    _require_trading_owner(owner_email)
+    try:
+        result = _dhan_client().cancel_order(req.order_id)
+    except Exception as e:
+        raise HTTPException(502, f"Dhan error: {e}")
+    return _clean(result)

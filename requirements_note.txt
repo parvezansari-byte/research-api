@@ -1,0 +1,8 @@
+Add this ONE line to requirements.txt (any line, e.g. at the end):
+
+fpdf2
+
+IMPORTANT: use PowerShell's Set-Content (not >>) to avoid the UTF-16
+encoding corruption we hit before:
+
+    Add-Content -Path requirements.txt -Value "fpdf2" -Encoding utf8
