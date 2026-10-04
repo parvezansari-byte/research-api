@@ -712,7 +712,29 @@ def _m_compute_chart(symbol: str, timeframe: str):
     range_pct = ((high - low) / low * 100) if low else None
 
     fmt = "%H:%M" if cfg["interval"].endswith("m") else "%d-%b"
-    series = [{"label": ts.strftime(fmt), "close": float(c)} for ts, c in closes.items()]
+    # Keep open/high/low alongside close for each bar so the app can draw
+    # real OHLC candlesticks, not just a line through the closes. Volume is
+    # included too for a volume-bars overlay. Falls back to the close price
+    # for O/H/L if a column is missing or NaN on a given row (keeps the line
+    # chart working even if candle data is incomplete for some bar).
+    opens = df["Open"] if "Open" in df.columns else closes
+    highs = df["High"] if "High" in df.columns else closes
+    lows = df["Low"] if "Low" in df.columns else closes
+    vols = df["Volume"] if "Volume" in df.columns else None
+    series = []
+    for ts, c in closes.items():
+        o = opens.get(ts)
+        h = highs.get(ts)
+        lo_ = lows.get(ts)
+        v = vols.get(ts) if vols is not None else None
+        series.append({
+            "label": ts.strftime(fmt),
+            "close": float(c),
+            "open": float(o) if o is not None and o == o else float(c),
+            "high": float(h) if h is not None and h == h else float(c),
+            "low": float(lo_) if lo_ is not None and lo_ == lo_ else float(c),
+            "volume": float(v) if v is not None and v == v else None,
+        })
 
     return {
         "display": _M_DISPLAY_NAMES.get(symbol, symbol.replace(".NS", "")),
