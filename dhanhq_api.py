@@ -89,6 +89,7 @@ class DhanAPI:
             self.dhan = dhanhq(client_id, access_token)
 
         self.client_id = client_id
+        self.access_token = access_token
         self._scrip_df: pd.DataFrame | None = None
         logger.info("DhanAPI initialised for client %s", client_id)
 
@@ -209,14 +210,51 @@ class DhanAPI:
     # ------------------------------------------------------------------ #
     # Options
     # ------------------------------------------------------------------ #
+    def _post_raw(self, endpoint: str, payload: dict, what: str):
+        """
+        Call a Dhan Data API endpoint directly (bypassing the SDK) so that
+        when Dhan rejects the request we can show its *actual* message. The
+        SDK's error parser only looks for errorCode/errorType/errorMessage
+        keys, but the Data APIs report errors as {"data": {"8xx": "..."},
+        "status": "failed"} - so through the SDK every such failure shows
+        up as a useless all-None dict.
+        """
+        import requests
+
+        try:
+            r = requests.post(
+                "https://api.dhan.co/v2" + endpoint,
+                json=payload,
+                headers={
+                    "access-token": self.access_token,
+                    "client-id": str(self.client_id),
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=25,
+            )
+        except Exception as e:
+            raise DhanAPIError(f"{what}: could not reach Dhan ({e})")
+
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+
+        if r.status_code != 200 or not isinstance(body, dict) or body.get("status") not in (None, "success"):
+            detail = body if body is not None else (r.text or "")[:300]
+            raise DhanAPIError(f"{what} failed (HTTP {r.status_code}): {detail}")
+        return body.get("data")
+
     def get_option_expiries(self, under_security_id,
                              under_exchange_segment: str = "IDX_I") -> list:
         """All available expiry dates for an underlying (index or stock)."""
-        resp = self.dhan.expiry_list(
-            under_security_id=int(under_security_id),
-            under_exchange_segment=under_exchange_segment,
+        data = self._post_raw(
+            "/optionchain/expirylist",
+            {"UnderlyingScrip": int(under_security_id),
+             "UnderlyingSeg": under_exchange_segment},
+            "get_option_expiries",
         )
-        data = self._unwrap(resp, "get_option_expiries")
         return list(data or [])
 
     def get_option_chain(self, under_security_id, expiry: str,
@@ -226,12 +264,13 @@ class DhanAPI:
         {'ce': {...}, 'pe': {...}}, ...}}. Dhan rate-limits this endpoint to
         one request every 3 seconds per the API docs.
         """
-        resp = self.dhan.option_chain(
-            under_security_id=int(under_security_id),
-            under_exchange_segment=under_exchange_segment,
-            expiry=expiry,
-        )
-        return self._unwrap(resp, "get_option_chain")
+        return self._post_raw(
+            "/optionchain",
+            {"UnderlyingScrip": int(under_security_id),
+             "UnderlyingSeg": under_exchange_segment,
+             "Expiry": expiry},
+            "get_option_chain",
+        ) or {}
 
     # ------------------------------------------------------------------ #
     # Account / portfolio
