@@ -4434,3 +4434,195 @@ def options_chain(index: str, expiry: str = "", strikes: int = 10):
     except Exception as e:
         raise HTTPException(500, f"Could not load option chain: {e}")
     return _clean(_build_option_chain(raw, max(1, min(strikes, 40))))
+
+
+# =============================================================================
+# SIGNAL ENGINE (personal use only — gated by owner email)
+# -----------------------------------------------------------------------------
+# This is NOT a win-rate predictor. There is no strategy — VWAP-based or
+# otherwise — that reliably wins 90% of trades on index F&O; any tool that
+# claims that is either overfit to past data or quietly selling far-OTM
+# premium (which "wins" often until one large loss erases months of gains).
+#
+# What this actually does: it computes a handful of well-known, genuinely
+# independent technical/positioning readings (price vs VWAP, RSI(14),
+# SMA(9/20) crossover, option-chain PCR, spot vs max pain) and reports how
+# many agree, with the real numbers behind each one. A "BUY CE"/"BUY PE"
+# result means "most of these indicators currently lean that way" — it is a
+# decision-support aggregate, not a probability, and it carries no implied
+# win rate. Always paired with a disclaimer in the response.
+# =============================================================================
+_SIGNAL_ALLOWED_EMAILS = {"parvez.ansari@wealthy.in"}
+
+_SIGNAL_TICKERS = {
+    "NIFTY 50": "^NSEI",
+    "BANK NIFTY": "^NSEBANK",
+}
+
+
+def _require_signal_access(owner_email: str):
+    if (owner_email or "").strip().lower() not in _SIGNAL_ALLOWED_EMAILS:
+        raise HTTPException(403, "Signals are restricted to the account owner.")
+
+
+def _rsi(closes, period: int = 14):
+    """Classic Wilder RSI over a pandas Series of closes. Returns a Series
+    (NaN for the first `period` bars, where there isn't enough history)."""
+    delta = closes.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+
+def _vwap_today(ticker: str):
+    """Intraday VWAP for today's session only (VWAP resets every day)."""
+    df = _myf.Ticker(ticker).history(period="1d", interval="5m")
+    if df.empty:
+        return None, None
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    vwap = (typical * df["Volume"]).cumsum() / df["Volume"].cumsum().replace(0, float("nan"))
+    last_close = float(df["Close"].iloc[-1])
+    last_vwap = float(vwap.iloc[-1]) if not math.isnan(vwap.iloc[-1]) else last_close
+    return last_close, last_vwap
+
+
+def _trend_readings(ticker: str):
+    """RSI(14) and SMA(9)/SMA(20) crossover on 15-minute bars over the last
+    few days — enough history for both to be meaningful intraday."""
+    df = _myf.Ticker(ticker).history(period="5d", interval="15m")
+    closes = df["Close"].dropna()
+    if len(closes) < 21:
+        return None
+    rsi_val = float(_rsi(closes).iloc[-1])
+    sma_fast = float(closes.rolling(9).mean().iloc[-1])
+    sma_slow = float(closes.rolling(20).mean().iloc[-1])
+    return {"rsi": rsi_val, "sma_fast": sma_fast, "sma_slow": sma_slow}
+
+
+def _lean(label: str, bullish: bool | None, detail: str):
+    return {"label": label, "lean": ("bullish" if bullish else "bearish") if bullish is not None else "neutral", "detail": detail}
+
+
+@app.get("/signals/{index}")
+def signals(index: str, owner_email: str, strikes: int = 10):
+    """Composite technical + positioning reading for one index. Restricted
+    to the account owner — see _SIGNAL_ALLOWED_EMAILS above."""
+    _require_signal_access(owner_email)
+
+    ticker = _SIGNAL_TICKERS.get(index.upper())
+    if not ticker:
+        raise HTTPException(404, f"No signal support for {index} yet (NIFTY 50 and BANK NIFTY only).")
+
+    readings = []
+    score = 0
+
+    # ---- Price vs VWAP ----
+    try:
+        price, vwap = _vwap_today(ticker)
+        if price is not None:
+            diff_pct = (price - vwap) / vwap * 100 if vwap else 0
+            if diff_pct > 0.05:
+                readings.append(_lean("Price vs VWAP", True, f"₹{round(price,2)} is {round(diff_pct,2)}% above VWAP ₹{round(vwap,2)}"))
+                score += 1
+            elif diff_pct < -0.05:
+                readings.append(_lean("Price vs VWAP", False, f"₹{round(price,2)} is {round(abs(diff_pct),2)}% below VWAP ₹{round(vwap,2)}"))
+                score -= 1
+            else:
+                readings.append(_lean("Price vs VWAP", None, f"₹{round(price,2)} is within 0.05% of VWAP ₹{round(vwap,2)}"))
+    except Exception as e:
+        readings.append(_lean("Price vs VWAP", None, f"Unavailable: {e}"))
+
+    # ---- RSI(14) + SMA(9/20) crossover, both on 15m bars ----
+    try:
+        trend = _trend_readings(ticker)
+        if trend:
+            rsi_val = trend["rsi"]
+            if rsi_val > 55:
+                readings.append(_lean("RSI(14)", True, f"{round(rsi_val,1)} — trending up"))
+                score += 1
+            elif rsi_val < 45:
+                readings.append(_lean("RSI(14)", False, f"{round(rsi_val,1)} — trending down"))
+                score -= 1
+            else:
+                readings.append(_lean("RSI(14)", None, f"{round(rsi_val,1)} — no clear trend"))
+
+            fast, slow = trend["sma_fast"], trend["sma_slow"]
+            if fast > slow:
+                readings.append(_lean("SMA(9) vs SMA(20)", True, f"{round(fast,1)} above {round(slow,1)}"))
+                score += 1
+            else:
+                readings.append(_lean("SMA(9) vs SMA(20)", False, f"{round(fast,1)} below {round(slow,1)}"))
+                score -= 1
+        else:
+            readings.append(_lean("RSI / SMA trend", None, "Not enough intraday history yet"))
+    except Exception as e:
+        readings.append(_lean("RSI / SMA trend", None, f"Unavailable: {e}"))
+
+    # ---- Option chain: PCR + spot vs max pain ----
+    chain_error = None
+    try:
+        client, sec_id = _resolve_index_security_id(index)
+        expiries = client.get_option_expiries(sec_id)
+        if expiries:
+            raw = client.get_option_chain(sec_id, expiries[0])
+            chain = _build_option_chain(raw, max(1, min(strikes, 40)))
+            pcr = chain.get("pcr") or 0
+            if pcr > 1.0:
+                readings.append(_lean("PCR (OI)", True, f"{pcr} — put writers dominate"))
+                score += 1
+            elif pcr > 0 and pcr < 0.7:
+                readings.append(_lean("PCR (OI)", False, f"{pcr} — call writers dominate"))
+                score -= 1
+            else:
+                readings.append(_lean("PCR (OI)", None, f"{pcr} — balanced"))
+
+            spot, max_pain = chain.get("spot"), chain.get("max_pain")
+            if spot and max_pain:
+                gap_pct = (spot - max_pain) / max_pain * 100
+                if gap_pct > 0.3:
+                    readings.append(_lean("Spot vs max pain", False, f"Spot {round(spot,1)} is {round(gap_pct,2)}% above max pain {round(max_pain,1)} — may drift back down"))
+                    score -= 1
+                elif gap_pct < -0.3:
+                    readings.append(_lean("Spot vs max pain", True, f"Spot {round(spot,1)} is {round(abs(gap_pct),2)}% below max pain {round(max_pain,1)} — may drift back up"))
+                    score += 1
+                else:
+                    readings.append(_lean("Spot vs max pain", None, f"Spot {round(spot,1)} is near max pain {round(max_pain,1)}"))
+        else:
+            chain_error = "No option expiries available"
+    except Exception as e:
+        chain_error = str(e)
+    if chain_error:
+        readings.append(_lean("Option chain (PCR / max pain)", None, f"Unavailable: {chain_error}"))
+
+    bullish = sum(1 for r in readings if r["lean"] == "bullish")
+    bearish = sum(1 for r in readings if r["lean"] == "bearish")
+    neutral = sum(1 for r in readings if r["lean"] == "neutral")
+
+    if score >= 2:
+        signal_text = "Leans BUY CE (bullish bias)"
+    elif score <= -2:
+        signal_text = "Leans BUY PE (bearish bias)"
+    else:
+        signal_text = "WAIT — no clear edge right now"
+
+    return _clean({
+        "index": index,
+        "signal": signal_text,
+        "score": score,
+        "agree": f"{max(bullish, bearish)}/{len(readings)}",
+        "bullish_count": bullish,
+        "bearish_count": bearish,
+        "neutral_count": neutral,
+        "readings": readings,
+        "updated": _mdatetime.now().strftime("%d-%b-%Y %H:%M"),
+        "disclaimer": (
+            "This combines a few independent technical and positioning "
+            "readings into one lean — it is not a win-rate prediction and "
+            "is not guaranteed. No strategy wins 90% of trades on index "
+            "F&O; always size positions so a wrong call is affordable."
+        ),
+    })
