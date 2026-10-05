@@ -4478,16 +4478,31 @@ def _rsi(closes, period: int = 14):
     return rsi.fillna(50)
 
 
+def _session_vwap(df):
+    """Per-session (resets each day) VWAP series for an OHLCV frame.
+
+    Yahoo usually reports zero volume for index symbols like ^NSEI, which
+    would make a true VWAP undefined. When there is no volume at all we fall
+    back to the equal-weighted average of typical price since the session
+    open, and return has_volume=False so callers can label it honestly.
+    """
+    import pandas as pd
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    day = pd.Series(df.index.date, index=df.index)
+    vol = df["Volume"].fillna(0) if "Volume" in df.columns else pd.Series(0.0, index=df.index)
+    has_volume = float(vol.sum()) > 0
+    w = vol if has_volume else pd.Series(1.0, index=df.index)
+    vwap = (typical * w).groupby(day).cumsum() / w.groupby(day).cumsum()
+    return vwap, has_volume
+
+
 def _vwap_today(ticker: str):
-    """Intraday VWAP for today's session only (VWAP resets every day)."""
+    """Intraday VWAP for today's session. Returns (price, vwap, has_volume)."""
     df = _myf.Ticker(ticker).history(period="1d", interval="5m")
     if df.empty:
-        return None, None
-    typical = (df["High"] + df["Low"] + df["Close"]) / 3
-    vwap = (typical * df["Volume"]).cumsum() / df["Volume"].cumsum().replace(0, float("nan"))
-    last_close = float(df["Close"].iloc[-1])
-    last_vwap = float(vwap.iloc[-1]) if not math.isnan(vwap.iloc[-1]) else last_close
-    return last_close, last_vwap
+        return None, None, True
+    vwap, has_volume = _session_vwap(df)
+    return float(df["Close"].iloc[-1]), float(vwap.iloc[-1]), has_volume
 
 
 def _trend_readings(ticker: str):
@@ -4522,17 +4537,19 @@ def signals(index: str, owner_email: str, strikes: int = 10):
 
     # ---- Price vs VWAP ----
     try:
-        price, vwap = _vwap_today(ticker)
+        price, vwap, has_vol = _vwap_today(ticker)
+        vlabel = "Price vs VWAP" if has_vol else "Price vs session avg (index has no volume)"
+        vname = "VWAP" if has_vol else "session average"
         if price is not None:
             diff_pct = (price - vwap) / vwap * 100 if vwap else 0
             if diff_pct > 0.05:
-                readings.append(_lean("Price vs VWAP", True, f"₹{round(price,2)} is {round(diff_pct,2)}% above VWAP ₹{round(vwap,2)}"))
+                readings.append(_lean(vlabel, True, f"₹{round(price,2)} is {round(diff_pct,2)}% above {vname} ₹{round(vwap,2)}"))
                 score += 1
             elif diff_pct < -0.05:
-                readings.append(_lean("Price vs VWAP", False, f"₹{round(price,2)} is {round(abs(diff_pct),2)}% below VWAP ₹{round(vwap,2)}"))
+                readings.append(_lean(vlabel, False, f"₹{round(price,2)} is {round(abs(diff_pct),2)}% below {vname} ₹{round(vwap,2)}"))
                 score -= 1
             else:
-                readings.append(_lean("Price vs VWAP", None, f"₹{round(price,2)} is within 0.05% of VWAP ₹{round(vwap,2)}"))
+                readings.append(_lean(vlabel, None, f"₹{round(price,2)} is within 0.05% of {vname} ₹{round(vwap,2)}"))
     except Exception as e:
         readings.append(_lean("Price vs VWAP", None, f"Unavailable: {e}"))
 
@@ -4626,3 +4643,132 @@ def signals(index: str, owner_email: str, strikes: int = 10):
             "F&O; always size positions so a wrong call is affordable."
         ),
     })
+
+
+# -----------------------------------------------------------------------------
+# SIGNAL BACKTEST
+# Replays the *price-based* signal rules on past bars. Only 3 of the 5 live
+# readings can be replayed (VWAP/session-average, RSI, SMA cross): there is no
+# free historical option-chain data, so PCR and max pain are not included.
+# It measures the INDEX moving in the signalled direction - not option premium
+# P&L, which also depends on theta, IV changes and bid/ask spread.
+# -----------------------------------------------------------------------------
+def _backtest_signals(df, horizon: int = 4, cost_pct: float = 0.03):
+    import pandas as pd
+
+    df = df.dropna(subset=["Close"]).copy()
+    if len(df) < 60:
+        return None
+
+    closes = df["Close"]
+    vwap, has_volume = _session_vwap(df)
+    rsi = _rsi(closes)
+    fast = closes.rolling(9).mean()
+    slow = closes.rolling(20).mean()
+
+    c = closes.to_numpy(dtype=float)
+    vw = vwap.to_numpy(dtype=float)
+    rs = rsi.to_numpy(dtype=float)
+    f = fast.to_numpy(dtype=float)
+    sl = slow.to_numpy(dtype=float)
+    days = [d for d in df.index.date]
+    n = len(c)
+
+    def vote(i):
+        score = 0
+        diff = (c[i] - vw[i]) / vw[i] * 100 if vw[i] else 0
+        score += 1 if diff > 0.05 else (-1 if diff < -0.05 else 0)
+        score += 1 if rs[i] > 55 else (-1 if rs[i] < 45 else 0)
+        score += 1 if f[i] > sl[i] else -1
+        return score
+
+    trades = []          # (direction, return_pct_after_cost)
+    up_moves = 0
+    eligible = 0
+    i = 20
+    while i < n - horizon:
+        j = i + horizon
+        if days[j] != days[i]:       # never hold overnight
+            i += 1
+            continue
+        eligible += 1
+        if c[j] > c[i]:
+            up_moves += 1
+        sc = vote(i)
+        direction = 1 if sc >= 2 else (-1 if sc <= -2 else 0)
+        if direction:
+            ret = direction * (c[j] / c[i] - 1) * 100 - cost_pct
+            trades.append((direction, ret))
+            i = j                     # no overlapping trades
+        else:
+            i += 1
+
+    if not trades:
+        return {"trades": 0, "note": "No signals fired in this period."}
+
+    rets = [r for _, r in trades]
+    wins = [r for r in rets if r > 0]
+    losses = [r for r in rets if r <= 0]
+
+    streak = worst_streak = 0
+    for r in rets:
+        streak = streak + 1 if r <= 0 else 0
+        worst_streak = max(worst_streak, streak)
+
+    equity = peak = max_dd = 0.0
+    for r in rets:
+        equity += r
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+
+    def wr(direction):
+        sub = [r for d, r in trades if d == direction]
+        return (round(sum(1 for r in sub if r > 0) / len(sub) * 100, 1), len(sub)) if sub else (None, 0)
+
+    long_wr, long_n = wr(1)
+    short_wr, short_n = wr(-1)
+    return {
+        "trades": len(trades),
+        "win_rate_pct": round(len(wins) / len(trades) * 100, 1),
+        "avg_return_pct": round(sum(rets) / len(rets), 3),
+        "avg_win_pct": round(sum(wins) / len(wins), 3) if wins else 0,
+        "avg_loss_pct": round(sum(losses) / len(losses), 3) if losses else 0,
+        "total_return_pct": round(sum(rets), 2),
+        "max_drawdown_pct": round(max_dd, 2),
+        "worst_losing_streak": worst_streak,
+        "long_win_rate_pct": long_wr, "long_trades": long_n,
+        "short_win_rate_pct": short_wr, "short_trades": short_n,
+        "baseline_up_pct": round(up_moves / eligible * 100, 1) if eligible else None,
+        "horizon_bars": horizon,
+        "horizon_minutes": horizon * 15,
+        "cost_pct_per_trade": cost_pct,
+        "period_start": str(df.index[0].date()),
+        "period_end": str(df.index[-1].date()),
+        "vwap_uses_volume": has_volume,
+    }
+
+
+@app.get("/signals/{index}/backtest")
+def signals_backtest(index: str, owner_email: str, horizon: int = 4, cost_pct: float = 0.03):
+    _require_signal_access(owner_email)
+    ticker = _SIGNAL_TICKERS.get(index.upper())
+    if not ticker:
+        raise HTTPException(404, f"No signal support for {index} yet (NIFTY 50 and BANK NIFTY only).")
+    horizon = max(1, min(horizon, 16))
+    try:
+        df = _myf.Ticker(ticker).history(period="60d", interval="15m")
+        result = _backtest_signals(df, horizon=horizon, cost_pct=max(0.0, min(cost_pct, 1.0)))
+    except Exception as e:
+        raise HTTPException(502, f"Backtest failed: {e}")
+    if result is None:
+        raise HTTPException(503, "Not enough intraday history to backtest.")
+    result["index"] = index
+    result["caveats"] = (
+        "Replays only the 3 price-based readings (VWAP/session average, RSI, "
+        "SMA cross) on the last ~60 days of 15-minute bars - Yahoo's limit. "
+        "PCR and max pain can't be replayed (no free historical option "
+        "data). Measures the index moving your way, not option P&L, which "
+        "also loses to theta and spread. 60 days is a small sample; past "
+        "results don't predict future ones."
+    )
+    return _clean(result)
