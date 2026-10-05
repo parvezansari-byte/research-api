@@ -721,6 +721,14 @@ def _m_compute_chart(symbol: str, timeframe: str):
     highs = df["High"] if "High" in df.columns else closes
     lows = df["Low"] if "Low" in df.columns else closes
     vols = df["Volume"] if "Volume" in df.columns else None
+    # Intraday charts also get a per-session VWAP line (resets each day).
+    # Daily/weekly/monthly bars have no meaningful session VWAP, so skipped.
+    vwap_series, vwap_has_volume = (None, True)
+    if cfg["interval"].endswith("m"):
+        try:
+            vwap_series, vwap_has_volume = _session_vwap(df)
+        except Exception:
+            vwap_series = None
     series = []
     for ts, c in closes.items():
         o = opens.get(ts)
@@ -734,6 +742,7 @@ def _m_compute_chart(symbol: str, timeframe: str):
             "high": float(h) if h is not None and h == h else float(c),
             "low": float(lo_) if lo_ is not None and lo_ == lo_ else float(c),
             "volume": float(v) if v is not None and v == v else None,
+            "vwap": (float(vwap_series.get(ts)) if vwap_series is not None and vwap_series.get(ts) == vwap_series.get(ts) else None),
         })
 
     return {
@@ -745,6 +754,8 @@ def _m_compute_chart(symbol: str, timeframe: str):
         "live": cfg["live"], "interval": cfg["interval"], "points": len(series),
         "baseline": round(baseline, 2), "baseline_label": baseline_label,
         "series": series,
+        "has_vwap": vwap_series is not None,
+        "vwap_uses_volume": vwap_has_volume,
     }
 
 
