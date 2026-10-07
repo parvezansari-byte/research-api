@@ -4784,5 +4784,5 @@ def signals_backtest(index: str, owner_email: str, horizon: int = 4, cost_pct: f
     )
     return _clean(result)
    # --- Mutual fund orders (stubbed NSE layer) ---
-   from orders_api import register_orders
-   register_orders(app, _supabase)
+from orders_api import register_orders
+register_orders(app, _supabase)
