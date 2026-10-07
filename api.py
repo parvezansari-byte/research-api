@@ -4783,3 +4783,6 @@ def signals_backtest(index: str, owner_email: str, horizon: int = 4, cost_pct: f
         "results don't predict future ones."
     )
     return _clean(result)
+   # --- Mutual fund orders (stubbed NSE layer) ---
+   from orders_api import register_orders
+   register_orders(app, _supabase)
