@@ -63,6 +63,11 @@ _snapshot = {
 
 _DROP_WORDS = {"option", "scheme", "fund"}
 _ALIASES = {
+    "pru": "prudential", "fofs": "fof", "eq": "equity", "eco": "economic", "bonds": "bond",
+    "jan": "january", "feb": "february", "mar": "march", "apr": "april", "jun": "june",
+    "jul": "july", "aug": "august", "sep": "september", "sept": "september",
+    "oct": "october", "nov": "november", "dec": "december",
+
     "sl": "sun life", "flexicap": "flexi cap", "multicap": "multi cap",
     "largecap": "large cap", "midcap": "mid cap", "smallcap": "small cap",
     "intl": "international", "mfg": "manufacturing", "opp": "opportunities",
@@ -76,6 +81,8 @@ def norm_name(name: str) -> str:
     """Lower-case, '&'->'and', punctuation removed, 'Nifty50'->'nifty 50', 'SL'->'sun life'."""
     text = (name or "").lower().replace("&", " and ").replace("'", "").replace("\u2019", "")
     text = text.replace("+", " plus ")
+    text = re.sub(r"\boff[\s-]+shore\b", "offshore", text)
+    text = re.sub(r"\bbanking and psu debt\b", "banking and psu", text)
     text = re.sub(r"\bfund[\s-]+of[\s-]+funds?\b", "fof", text)   # 'Fund of Fund(s)' -> 'FoF'
     text = re.sub(r"([a-z])(\d)", r"\1 \2", text)
     text = re.sub(r"(\d)([a-z])", r"\1 \2", text)
