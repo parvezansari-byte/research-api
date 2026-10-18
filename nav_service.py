@@ -25,6 +25,7 @@ File layout (semicolon separated, plus section/AMC heading lines we skip):
   120465;INF846K01DP8;-;Axis Bluechip Fund - Regular Plan - Growth;62.31;07-Oct-2026
 """
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -55,7 +56,43 @@ _snapshot = {
     "latest_date": None,   # newest NAV date in the file
     "last_attempt": 0.0,
     "last_error": None,
+    "prev": {},            # scheme_code -> (previous nav, its date), once a newer date arrives
+    "by_name": {},         # normalised scheme name -> scheme_code
 }
+
+
+_DROP_WORDS = {"option", "scheme"}
+
+
+def norm_name(name: str) -> str:
+    """Lower-case, '&'->'and', punctuation removed: matches fund names across sources."""
+    text = (name or "").lower().replace("&", " and ")
+    words = [w for w in re.split(r"[^a-z0-9]+", text) if w and w not in _DROP_WORDS]
+    return " ".join(words)
+
+
+def _build_name_index(data: dict) -> dict:
+    index = {}
+    for code, row in data.items():
+        key = norm_name(row["name"])
+        other = index.get(key)
+        if other is None or row["date"] > data[other]["date"]:
+            index[key] = code
+    return index
+
+
+def _roll_prev(old: dict, new: dict, old_prev: dict) -> dict:
+    """Previous-day NAV per scheme: when a scheme's date moves forward, its old NAV becomes 'prev'."""
+    prev = {}
+    for code, row in new.items():
+        o = old.get(code)
+        if not o:
+            continue
+        if row["date"] > o["date"]:
+            prev[code] = (o["nav"], o["date"])
+        elif code in old_prev:
+            prev[code] = old_prev[code]
+    return prev
 
 
 def _find_col(header: list, *needles, default: int):
@@ -176,6 +213,8 @@ def refresh(force: bool = False, now: float = None) -> bool:
             logger.warning("AMFI NAV refresh failed: %s", e)
             return False
         _snapshot.update(
+            prev=_roll_prev(_snapshot["data"], data, _snapshot["prev"]),
+            by_name=_build_name_index(data),
             data=data,
             fetched_at=now,
             latest_date=max(v["date"] for v in data.values()),
@@ -200,6 +239,27 @@ def get_nav(scheme_code: str, now: float = None):
     return row["nav"], row["date"].strftime("%d-%m-%Y")
 
 
+def lookup_by_name(name: str, now: float = None):
+    """
+    Latest NAV for a fund looked up by its name (as AMFI spells it).
+    Returns {code, nav, date, prev_nav, day_pct} or None. Does not download by
+    itself when the snapshot is already loaded; callers should call refresh() first.
+    """
+    now = time.time() if now is None else now
+    if now - _snapshot["fetched_at"] > MAX_STALE_SECONDS:
+        return None
+    code = _snapshot["by_name"].get(norm_name(name))
+    row = _snapshot["data"].get(code) if code else None
+    if not row:
+        return None
+    prev = _snapshot["prev"].get(code)
+    day_pct = None
+    if prev and prev[0]:
+        day_pct = round((row["nav"] - prev[0]) / prev[0] * 100, 2)
+    return {"code": code, "nav": row["nav"], "date": row["date"],
+            "prev_nav": prev[0] if prev else None, "day_pct": day_pct}
+
+
 def scheme_name(scheme_code: str):
     row = _snapshot["data"].get(str(scheme_code).strip())
     return row["name"] if row else None
@@ -221,6 +281,8 @@ def status(now: float = None) -> dict:
 
 def register_nav(app):
     """Attach the NAV routes to the FastAPI app."""
+    from funds_nav import register_funds_nav  # live NAV on the Funds screen
+    register_funds_nav(app)
 
     @app.get("/nav/status")
     def nav_status():
