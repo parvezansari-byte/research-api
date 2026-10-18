@@ -62,22 +62,43 @@ _snapshot = {
 
 
 _DROP_WORDS = {"option", "scheme"}
+_ALIASES = {"sl": "sun life", "flexicap": "flexi cap", "multicap": "multi cap",
+            "largecap": "large cap", "midcap": "mid cap", "smallcap": "small cap"}
 
 
 def norm_name(name: str) -> str:
-    """Lower-case, '&'->'and', punctuation removed: matches fund names across sources."""
+    """Lower-case, '&'->'and', punctuation removed, 'Nifty50'->'nifty 50', 'SL'->'sun life'."""
     text = (name or "").lower().replace("&", " and ")
-    words = [w for w in re.split(r"[^a-z0-9]+", text) if w and w not in _DROP_WORDS]
+    text = re.sub(r"([a-z])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([a-z])", r"\1 \2", text)
+    words = []
+    for w in re.split(r"[^a-z0-9]+", text):
+        if not w or w in _DROP_WORDS:
+            continue
+        words.append(_ALIASES.get(w, w))
     return " ".join(words)
+
+
+def _full_name(row: dict) -> str:
+    """'360 ONE Flexicap Fund' + 'Regular Plan' + 'GROWTH Option' -> '360 ONE Flexicap Fund - Regular Plan - GROWTH Option'."""
+    plan, option = row.get("plan") or "", row.get("option") or ""
+    if not (plan or option):
+        return row["name"]
+    if plan and "plan" not in plan.lower():
+        plan += " Plan"
+    return " - ".join(x for x in (row["name"], plan, option) if x)
 
 
 def _build_name_index(data: dict) -> dict:
     index = {}
     for code, row in data.items():
-        key = norm_name(row["name"])
-        other = index.get(key)
-        if other is None or row["date"] > data[other]["date"]:
-            index[key] = code
+        keys = {norm_name(_full_name(row))}
+        if "plan" in row["name"].lower() or not (row.get("plan") or row.get("option")):
+            keys.add(norm_name(row["name"]))   # name already carries plan/option
+        for key in keys:
+            other = index.get(key)
+            if other is None or row["date"] > data[other]["date"]:
+                index[key] = code
     return index
 
 
@@ -113,12 +134,17 @@ def parse_navall(text: str) -> dict:
     """
     out = {}
     c_name, c_nav, c_date = 3, 4, 5
+    c_plan = c_opt = None
     for line in text.splitlines():
         parts = [p.strip() for p in line.split(";")]
         if parts and parts[0].lower().startswith("scheme code"):
             c_name = _find_col(parts, "scheme", "name", default=3)
             c_nav = _find_col(parts, "net asset", default=_find_col(parts, "nav", default=4))
             c_date = _find_col(parts, "date", default=c_nav + 1)
+            c_plan = _find_col(parts, "plan", default=None) if any(
+                h.lower() == "plan" for h in parts) else None
+            c_opt = _find_col(parts, "option", default=None) if any(
+                h.lower() == "option" for h in parts) else None
             continue
         if len(parts) <= max(c_name, c_nav, c_date) or not parts[0].isdigit():
             continue
@@ -129,7 +155,12 @@ def parse_navall(text: str) -> dict:
             continue  # "N.A.", blank, or an unexpected date format
         if nav <= 0:
             continue
-        out[parts[0]] = {"nav": nav, "date": nav_date, "name": parts[c_name]}
+        row = {"nav": nav, "date": nav_date, "name": parts[c_name]}
+        if c_plan is not None and c_plan < len(parts):
+            row["plan"] = parts[c_plan]
+        if c_opt is not None and c_opt < len(parts):
+            row["option"] = parts[c_opt]
+        out[parts[0]] = row
     return out
 
 
@@ -262,7 +293,7 @@ def lookup_by_name(name: str, now: float = None):
 
 def scheme_name(scheme_code: str):
     row = _snapshot["data"].get(str(scheme_code).strip())
-    return row["name"] if row else None
+    return _full_name(row) if row else None
 
 
 def status(now: float = None) -> dict:
