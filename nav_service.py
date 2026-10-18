@@ -75,6 +75,8 @@ _ALIASES = {
 def norm_name(name: str) -> str:
     """Lower-case, '&'->'and', punctuation removed, 'Nifty50'->'nifty 50', 'SL'->'sun life'."""
     text = (name or "").lower().replace("&", " and ").replace("'", "").replace("\u2019", "")
+    text = text.replace("+", " plus ")
+    text = re.sub(r"\bfund[\s-]+of[\s-]+funds?\b", "fof", text)   # 'Fund of Fund(s)' -> 'FoF'
     text = re.sub(r"([a-z])(\d)", r"\1 \2", text)
     text = re.sub(r"(\d)([a-z])", r"\1 \2", text)
     words = []
