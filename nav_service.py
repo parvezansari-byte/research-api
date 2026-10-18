@@ -58,21 +58,41 @@ _snapshot = {
 }
 
 
+def _find_col(header: list, *needles, default: int):
+    for i, h in enumerate(header):
+        low = h.lower()
+        if all(n in low for n in needles):
+            return i
+    return default
+
+
 def parse_navall(text: str) -> dict:
-    """Parse AMFI's file into {scheme_code: {nav, date, name}}; skips junk lines."""
+    """
+    Parse AMFI's file into {scheme_code: {nav, date, name}}; skips junk lines.
+
+    Column positions are read from the header row ("Scheme Code;...;Net Asset
+    Value;Date"), because AMFI has added columns (Plan, Option) before. If no
+    header is seen, the older fixed layout (name=3, NAV=4, date=5) is assumed.
+    """
     out = {}
+    c_name, c_nav, c_date = 3, 4, 5
     for line in text.splitlines():
         parts = [p.strip() for p in line.split(";")]
-        if len(parts) < 6 or not parts[0].isdigit():
+        if parts and parts[0].lower().startswith("scheme code"):
+            c_name = _find_col(parts, "scheme", "name", default=3)
+            c_nav = _find_col(parts, "net asset", default=_find_col(parts, "nav", default=4))
+            c_date = _find_col(parts, "date", default=c_nav + 1)
+            continue
+        if len(parts) <= max(c_name, c_nav, c_date) or not parts[0].isdigit():
             continue
         try:
-            nav = float(parts[4])
-            nav_date = datetime.strptime(parts[5], "%d-%b-%Y").date()
+            nav = float(parts[c_nav])
+            nav_date = datetime.strptime(parts[c_date], "%d-%b-%Y").date()
         except ValueError:
             continue  # "N.A.", blank, or an unexpected date format
         if nav <= 0:
             continue
-        out[parts[0]] = {"nav": nav, "date": nav_date, "name": parts[3]}
+        out[parts[0]] = {"nav": nav, "date": nav_date, "name": parts[c_name]}
     return out
 
 
