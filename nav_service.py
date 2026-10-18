@@ -76,17 +76,55 @@ def parse_navall(text: str) -> dict:
     return out
 
 
+_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "text/plain,text/html;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9",
+    "Referer": "https://www.amfiindia.com/",
+}
+
+
+def _looks_like_navall(text: str) -> bool:
+    """True if the text has at least a few NAV rows (not an HTML block page)."""
+    return len(parse_navall(text[:200000])) >= 50
+
+
+def _snippet(text: str) -> str:
+    return " ".join(text[:120].split())
+
+
+def _fetch_one(url: str):
+    """Try plain requests, then a browser-impersonating client. Returns (text, note)."""
+    note = ""
+    try:
+        r = requests.get(url, headers=_BROWSER_HEADERS, timeout=40)
+        text = r.content.decode("utf-8-sig", errors="replace")
+        if r.status_code == 200 and _looks_like_navall(text):
+            return text, ""
+        note = f"HTTP {r.status_code}, {len(text)} chars, starts: '{_snippet(text)}'"
+    except Exception as e:
+        note = f"requests failed: {e}"
+    try:  # some sites only answer real-browser TLS fingerprints
+        from curl_cffi import requests as cffi
+        r = cffi.get(url, headers=_BROWSER_HEADERS, timeout=40, impersonate="chrome")
+        text = r.content.decode("utf-8-sig", errors="replace")
+        if r.status_code == 200 and _looks_like_navall(text):
+            return text, ""
+        note += f" | browser-mode HTTP {r.status_code}, starts: '{_snippet(text)}'"
+    except Exception as e:
+        note += f" | browser-mode failed: {e}"
+    return None, note
+
+
 def _download() -> str:
-    last_error = None
+    problems = []
     for url in AMFI_URLS:
-        try:
-            r = requests.get(url, headers=_HEADERS, timeout=40)
-            if r.status_code == 200 and len(r.text) > 1000:
-                return r.text
-            last_error = f"{url} returned HTTP {r.status_code}"
-        except Exception as e:
-            last_error = f"{url}: {e}"
-    raise RuntimeError(last_error or "AMFI download failed")
+        text, note = _fetch_one(url)
+        if text:
+            return text
+        problems.append(f"{url.split('/')[2]}: {note}")
+    raise RuntimeError(" || ".join(problems)[:600])
 
 
 def _needs_refresh(now: float) -> bool:
@@ -114,7 +152,7 @@ def refresh(force: bool = False, now: float = None) -> bool:
             if len(data) < MIN_ROWS:
                 raise ValueError(f"only {len(data)} schemes could be read from the file")
         except Exception as e:
-            _snapshot["last_error"] = str(e)[:200]
+            _snapshot["last_error"] = str(e)[:700]
             logger.warning("AMFI NAV refresh failed: %s", e)
             return False
         _snapshot.update(
