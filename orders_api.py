@@ -137,6 +137,64 @@ def validate_order(req: OrderRequest) -> dict:
     }
 
 
+def check_redeem(sb, owner: str, client_id: int, fields: dict):
+    """
+    Raise unless the client holds enough units for this redemption.
+
+    Uses the holdings the advisor has recorded (holdings_api). Units already
+    committed to still-open redemption orders for the same fund are set aside,
+    so two quick redemptions can't both claim the same units.
+    """
+    import holdings_api
+
+    code = fields["scheme_code"]
+    held = holdings_api.held_units(sb, owner, client_id, code)
+    if not held:
+        raise HTTPException(
+            409,
+            "No holding is recorded for this fund. Add it under the client's "
+            "Holdings tab before redeeming.")
+
+    nav_info = []
+
+    def nav() -> float:
+        if not nav_info:
+            found = holdings_api.fetch_nav(code)
+            if not found:
+                raise HTTPException(
+                    503,
+                    "Couldn't fetch the latest NAV to check this redemption. "
+                    "Try again, or redeem by units.")
+            nav_info.append(found[0])
+        return nav_info[0]
+
+    pending = 0.0
+    open_rows = (sb.table("crm_orders").select("*")
+                 .eq("owner_email", owner).eq("client_id", client_id)
+                 .eq("scheme_code", code).eq("order_type", "REDEEM")
+                 .execute()).data or []
+    for o in open_rows:
+        if o["status"] in TERMINAL_STATUSES:
+            continue
+        if o.get("units"):
+            pending += float(o["units"])
+        elif o.get("amount"):
+            pending += float(o["amount"]) / nav()
+
+    available = held - pending
+    if fields["units"] is not None:
+        need = float(fields["units"])
+    else:
+        need = float(fields["amount"]) / nav()
+    if need > available + 0.0005:
+        note = (f", minus {pending:,.3f} already in open redemption orders"
+                if pending else "")
+        raise HTTPException(
+            409,
+            f"This redemption is more than the {max(available, 0):,.3f} units "
+            f"available ({held:,.3f} held{note}).")
+
+
 def register_orders(app, supabase_getter):
     """Attach the order routes to the FastAPI app."""
 
@@ -240,6 +298,9 @@ def register_orders(app, supabase_getter):
             if nse.name == "LIVE" and not client.get("nse_client_code"):
                 raise HTTPException(409, "This client has no NSE client code yet")
 
+            if fields["order_type"] == "REDEEM":
+                check_redeem(sb, owner, client_id, fields)
+
             row = {
                 "owner_email": owner,
                 "client_id": client_id,
@@ -337,3 +398,12 @@ def register_orders(app, supabase_getter):
         except Exception as e:
             raise HTTPException(502, f"Database error: {e}")
         return order
+
+    # The holdings routes ride along with the same hookup line in api.py,
+    # so api.py never needs another edit.
+    from holdings_api import register_holdings
+    register_holdings(app, supabase_getter)
+
+    # Push notifications ride along on the same hookup line too.
+    from push_api import register_push
+    register_push(app, supabase_getter)

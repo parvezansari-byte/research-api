@@ -1,0 +1,32 @@
+name: Push Tick
+
+# Calls the API every 15 minutes. The API decides what (if anything) to send:
+#  - signal flips for NIFTY 50 / BANK NIFTY during NSE hours
+#  - an hourly market + headline digest
+# Needs a repo secret named PUSH_TICK_SECRET that matches the PUSH_TICK_SECRET
+# environment variable set on Render.
+
+on:
+  schedule:
+    # UTC. 03:00-16:59 UTC = 08:30-22:29 IST, Monday-Friday. GitHub may run
+    # these a few minutes late; the API is idempotent so that's harmless.
+    - cron: "*/15 3-16 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /push/tick
+        env:
+          TICK_SECRET: ${{ secrets.PUSH_TICK_SECRET }}
+        run: |
+          code=$(curl -s -o resp.json -w "%{http_code}" --max-time 120 \
+                 -X POST -H "X-Tick-Secret: $TICK_SECRET" \
+                 https://research-api-8a34.onrender.com/push/tick)
+          echo "HTTP status: $code"
+          cat resp.json; echo
+          if [ "$code" -ge 400 ] || [ "$code" -eq 000 ]; then
+            echo "Tick failed"
+            exit 1
+          fi
