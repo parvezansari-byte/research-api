@@ -69,4 +69,4 @@ def register_funds_nav(app):
         missing = [f["name"] for f in data
                    if not nav_service.lookup_by_name(f.get("name") or "")]
         return {"funds": len(data), "matched": len(data) - len(missing),
-                "unmatched_sample": missing[:25]}
+                "unmatched_sample": missing[:80]}

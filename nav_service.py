@@ -61,14 +61,20 @@ _snapshot = {
 }
 
 
-_DROP_WORDS = {"option", "scheme"}
-_ALIASES = {"sl": "sun life", "flexicap": "flexi cap", "multicap": "multi cap",
-            "largecap": "large cap", "midcap": "mid cap", "smallcap": "small cap"}
+_DROP_WORDS = {"option", "scheme", "fund"}
+_ALIASES = {
+    "sl": "sun life", "flexicap": "flexi cap", "multicap": "multi cap",
+    "largecap": "large cap", "midcap": "mid cap", "smallcap": "small cap",
+    "intl": "international", "mfg": "manufacturing", "opp": "opportunities",
+    "opps": "opportunities", "fin": "financial", "serv": "services", "svcs": "services",
+    "svc": "services", "res": "resources", "rob": "robeco", "infra": "infrastructure",
+    "mkts": "markets", "mgmt": "management", "govt": "government", "sec": "securities",
+}
 
 
 def norm_name(name: str) -> str:
     """Lower-case, '&'->'and', punctuation removed, 'Nifty50'->'nifty 50', 'SL'->'sun life'."""
-    text = (name or "").lower().replace("&", " and ")
+    text = (name or "").lower().replace("&", " and ").replace("'", "").replace("\u2019", "")
     text = re.sub(r"([a-z])(\d)", r"\1 \2", text)
     text = re.sub(r"(\d)([a-z])", r"\1 \2", text)
     words = []
