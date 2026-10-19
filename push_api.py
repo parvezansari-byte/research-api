@@ -63,9 +63,23 @@ def state_set(sb, key: str, value: str):
     ).execute()
 
 
-def send_to_email(sb, email: str, title: str, body: str, data: Optional[dict] = None) -> dict:
+def save_history(sb, email: str, title: str, body: str, kind: str):
+    """Keep a copy of every alert so the app can show a Notifications list.
+    Never lets a history problem stop the push itself."""
+    try:
+        sb.table("push_history").insert(
+            {"owner_email": email, "title": title[:200], "body": body[:2000],
+             "kind": (kind or "info")[:20], "read": False}).execute()
+    except Exception as e:  # table missing, DB hiccup ...
+        print(f"push_history not saved: {e}")
+
+
+def send_to_email(sb, email: str, title: str, body: str, data: Optional[dict] = None,
+                  kind: Optional[str] = None) -> dict:
     """Send to every device registered for `email`; prune dead tokens."""
     import push_service
+
+    save_history(sb, email, title, body, kind or (data or {}).get("type") or "info")
 
     tokens = [r["token"] for r in (
         sb.table("push_tokens").select("token").eq("owner_email", email).execute().data or [])]
@@ -202,12 +216,42 @@ def register_push(app, supabase_getter):
         sb = _db()
         try:
             result = send_to_email(
-                sb, email, "Advantage test", "Push notifications are working on this phone.")
+                sb, email, "Advantage test", "Push notifications are working on this phone.",
+                kind="test")
         except push_service.PushConfigError as e:
             raise HTTPException(503, str(e))
         if result["devices"] == 0:
             raise HTTPException(404, "No device registered yet - open the app once, allow notifications, then retry.")
         return result
+
+    @app.get("/push/{email}/history")
+    def push_history(email: str, limit: int = 50):
+        """Latest alerts for the Notifications screen, newest first."""
+        email = _owner_only(email)
+        limit = max(1, min(int(limit), 200))
+        sb = _db()
+        try:
+            rows = (sb.table("push_history").select("*").eq("owner_email", email)
+                    .order("id", desc=True).limit(limit).execute().data or [])
+            unread = len(sb.table("push_history").select("id").eq("owner_email", email)
+                         .eq("read", False).execute().data or [])
+        except Exception as e:
+            raise HTTPException(500, f"Could not load notifications: {e}")
+        return {"unread": unread,
+                "items": [{"id": r["id"], "title": r.get("title", ""), "body": r.get("body", ""),
+                           "kind": r.get("kind", "info"), "read": bool(r.get("read")),
+                           "created_at": r.get("created_at")} for r in rows]}
+
+    @app.post("/push/{email}/history/read")
+    def push_history_read(email: str):
+        email = _owner_only(email)
+        sb = _db()
+        try:
+            sb.table("push_history").update({"read": True}).eq(
+                "owner_email", email).eq("read", False).execute()
+        except Exception as e:
+            raise HTTPException(500, f"Could not mark notifications read: {e}")
+        return {"ok": True}
 
     @app.post("/push/tick")
     def push_tick(job: str = "all", force: bool = False,

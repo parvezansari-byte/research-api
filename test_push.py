@@ -104,5 +104,38 @@ paths = {r.path for r in app2.routes}
 check("orders hookup also mounts push, holdings, nav",
       {"/push/tick", "/push/register", "/nav/status"} <= paths and
       any("portfolio" in p for p in paths))
+
+# ---- notification history ---------------------------------------------------
+sb2 = FakeSb()
+app3 = FastAPI()
+push_api.register_push(app3, lambda: sb2)
+h2 = TestClient(app3)
+h2.post("/push/register", json={"email": OWNER, "token": "h" * 30})
+for i in range(12):
+    push_api.send_to_email(sb2, OWNER, f"alert {i}", f"body {i}", {"type": "signal"})
+push_api.send_to_email(sb2, OWNER, "dig", "digest body", {"type": "digest"})
+r = h2.get(f"/push/{OWNER}/history?limit=5")
+j = r.json()
+check("history returns newest first, limited", r.status_code == 200 and len(j["items"]) == 5
+      and j["items"][0]["title"] == "dig" and j["items"][1]["title"] == "alert 11", r.text)
+check("history counts unread", j["unread"] == 13, str(j.get("unread")))
+check("history keeps kind", j["items"][0]["kind"] == "digest" and j["items"][1]["kind"] == "signal")
+check("history rejects other accounts", h2.get("/push/evil@x.com/history").status_code == 403)
+check("mark-read rejects other accounts", h2.post("/push/evil@x.com/history/read").status_code == 403)
+check("mark-read ok", h2.post(f"/push/{OWNER}/history/read").json() == {"ok": True})
+j = h2.get(f"/push/{OWNER}/history").json()
+check("unread is zero after mark-read", j["unread"] == 0 and len(j["items"]) == 13 and all(i["read"] for i in j["items"]))
+# test pushes are saved too, and a broken history table never blocks the push
+r = h2.post("/push/test", json={"email": OWNER})
+check("test push saved as kind=test", h2.get(f"/push/{OWNER}/history?limit=1").json()["items"][0]["kind"] == "test")
+class BrokenSb(FakeSb):
+    def table(self, name):
+        if name == "push_history":
+            raise Exception("relation does not exist")
+        return super().table(name)
+bsb = BrokenSb(); bsb.tables["push_tokens"] = [{"token": "k" * 30, "owner_email": OWNER}]
+res = push_api.send_to_email(bsb, OWNER, "t", "b", {"type": "signal"})
+check("missing history table does not stop the push", res["sent"] == 1, str(res))
+
 print("\nFAILED: %s" % failures if failures else "\nALL PASSED")
 raise SystemExit(1 if failures else 0)

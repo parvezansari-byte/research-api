@@ -13,6 +13,7 @@ class FakeQuery:
         self.rows = db.tables.setdefault(name, [])
         self.filters, self.mode, self.payload = [], "select", None
         self.order_by = None
+        self.max_rows = None
 
     def select(self, *_):
         self.mode = "select"
@@ -24,6 +25,10 @@ class FakeQuery:
 
     def order(self, col, desc=False):
         self.order_by = (col, desc)
+        return self
+
+    def limit(self, n):
+        self.max_rows = n
         return self
 
     def insert(self, row):
@@ -81,7 +86,9 @@ class FakeQuery:
         out = [dict(r) for r in self._match()]
         if self.order_by:
             col, desc = self.order_by
-            out.sort(key=lambda r: str(r.get(col)), reverse=desc)
+            out.sort(key=lambda r: (isinstance(r.get(col), str), r.get(col) if isinstance(r.get(col), (int, float)) else str(r.get(col))), reverse=desc)
+        if self.max_rows is not None:
+            out = out[:self.max_rows]
         return FakeResult(out)
 
 
