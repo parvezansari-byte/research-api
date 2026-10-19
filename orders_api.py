@@ -407,3 +407,7 @@ def register_orders(app, supabase_getter):
     # Push notifications ride along on the same hookup line too.
     from push_api import register_push
     register_push(app, supabase_getter)
+
+    # Signed login tokens + guard for email-scoped routes (see auth_guard.py).
+    from auth_guard import register_guard
+    register_guard(app)
