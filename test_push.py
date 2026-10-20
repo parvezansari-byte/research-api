@@ -137,5 +137,61 @@ bsb = BrokenSb(); bsb.tables["push_tokens"] = [{"token": "k" * 30, "owner_email"
 res = push_api.send_to_email(bsb, OWNER, "t", "b", {"type": "signal"})
 check("missing history table does not stop the push", res["sent"] == 1, str(res))
 
+
+# ---- NAV alert ----------------------------------------------------------------
+from datetime import date, timezone, timedelta
+IST_ = timezone(timedelta(hours=5, minutes=30))
+
+class StubNav:
+    def __init__(self, latest, rows):
+        self.latest, self.rows = latest, rows
+    def refresh(self): return False
+    def status(self): return {"nav_date": self.latest}
+    def day_change(self, code): return self.rows.get(code)
+
+d_new, d_old = date(2026, 10, 20), date(2026, 10, 19)
+nav_rows = {
+    "100": {"nav": 110.0, "date": d_new, "prev_nav": 100.0},   # +10%
+    "200": {"nav": 49.0,  "date": d_new, "prev_nav": 50.0},    # -2%
+}
+sb3 = FakeSb()
+sb3.tables["push_tokens"] = [{"token": "n" * 30, "owner_email": OWNER}]
+sb3.tables["crm_manual_holdings"] = [
+    {"owner_email": OWNER, "client_id": 1, "scheme_code": "100", "scheme_name": "Alpha Fund", "units": 10},
+    {"owner_email": OWNER, "client_id": 2, "scheme_code": "200", "scheme_name": "Beta Fund", "units": 100},
+    {"owner_email": "other@x.com", "client_id": 9, "scheme_code": "100", "scheme_name": "Alpha Fund", "units": 999},
+]
+nav = StubNav("2026-10-20", nav_rows)
+noon = datetime(2026, 10, 20, 20, 0, tzinfo=IST_)
+before = len(sent)
+check("nav: first run only records", "initialised" in push_api.check_nav(sb3, noon, nav_mod=nav) and len(sent) == before)
+check("nav: same date -> nothing", push_api.check_nav(sb3, noon, nav_mod=nav).startswith("already alerted"))
+nav.latest = "2026-10-21"
+for r in nav_rows.values():
+    r["date"] = date(2026, 10, 21)
+res = push_api.check_nav(sb3, noon, nav_mod=nav)
+check("nav: new date sends one alert", isinstance(res, dict) and res["sent"] == 1 and len(sent) == before + 1, str(res))
+t, body = sent[-1][1], sent[-1][2]
+check("nav: title has the date", "21 Oct 2026" in t, t)
+check("nav: only the owner's 2 holdings counted (value 10*110+100*49=6000)", "2 holdings across 2 clients" in body and "Rs 6,000" in body, body)
+check("nav: day change shown (+100 -100 = 0)", "% today" in body and "Top: Alpha Fund +10.00%" in body and "Weakest: Beta Fund -2.00%" in body, body)
+check("nav: saved to history as kind=nav", any(r["kind"] == "nav" for r in sb3.tables["push_history"]))
+check("nav: not sent twice", push_api.check_nav(sb3, noon, nav_mod=nav).startswith("already alerted"))
+# partial update: waits until most holdings have the new date (unless late evening / forced)
+nav.latest = "2026-10-22"
+nav_rows["100"]["date"] = date(2026, 10, 22)      # 1 of 2 updated = 50%
+early = datetime(2026, 10, 22, 19, 0, tzinfo=IST_)
+check("nav: waits while half the holdings are stale", push_api.check_nav(sb3, early, nav_mod=nav).startswith("waiting"))
+late = datetime(2026, 10, 22, 23, 30, tzinfo=IST_)
+check("nav: sends anyway late in the evening", isinstance(push_api.check_nav(sb3, late, nav_mod=nav), dict))
+# no previous NAV (fresh restart): still alerts, without a change line
+nav.latest = "2026-10-23"
+for r in nav_rows.values():
+    r["date"], r["prev_nav"] = date(2026, 10, 23), None
+push_api.check_nav(sb3, noon, nav_mod=nav)
+check("nav: no previous NAV -> says change comes next time", "from the next update" in sent[-1][2], sent[-1][2])
+check("nav: not loaded yet", push_api.check_nav(sb3, noon, nav_mod=StubNav(None, {})) == "NAV file not loaded yet")
+check("nav: no holdings is a quiet no-op", "no holdings" in push_api.check_nav(FakeSb(), noon, nav_mod=StubNav("2026-10-30", {})))
+
 print("\nFAILED: %s" % failures if failures else "\nALL PASSED")
 raise SystemExit(1 if failures else 0)

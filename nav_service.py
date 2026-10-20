@@ -306,6 +306,17 @@ def lookup_by_name(name: str, now: float = None):
             "prev_nav": prev[0] if prev else None, "day_pct": day_pct}
 
 
+def day_change(scheme_code: str):
+    """{nav, date, prev_nav} for one scheme from the loaded snapshot, or None.
+    prev_nav is None until a second AMFI date has been seen since the last restart."""
+    code = str(scheme_code).strip()
+    row = _snapshot["data"].get(code)
+    if not row:
+        return None
+    prev = _snapshot["prev"].get(code)
+    return {"nav": row["nav"], "date": row["date"], "prev_nav": prev[0] if prev else None}
+
+
 def scheme_name(scheme_code: str):
     row = _snapshot["data"].get(str(scheme_code).strip())
     return _full_name(row) if row else None

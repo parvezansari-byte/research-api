@@ -128,6 +128,84 @@ def check_signals(sb, signals_fn=None, sleep=time.sleep) -> dict:
     return out
 
 
+def _inr(x: float) -> str:
+    sign = "-" if x < 0 else ""
+    x = abs(x)
+    if x >= 1e7:
+        return f"{sign}Rs {x / 1e7:.2f} Cr"
+    if x >= 1e5:
+        return f"{sign}Rs {x / 1e5:.2f} L"
+    return f"{sign}Rs {x:,.0f}"
+
+
+NAV_READY_SHARE = 0.8      # wait until this share of holdings has the new date ...
+NAV_FALLBACK_HOUR = 23     # ... or until this hour (IST), then send anyway
+
+
+def check_nav(sb, now=None, force: bool = False, nav_mod=None) -> str:
+    """One alert per new AMFI NAV date, summarising the advisor's client holdings."""
+    if nav_mod is None:
+        import nav_service as nav_mod
+    now = now or datetime.now(IST)
+    try:
+        nav_mod.refresh()
+    except Exception as e:
+        return f"error: {e}"
+    latest = nav_mod.status().get("nav_date")           # 'YYYY-MM-DD' or None
+    if not latest:
+        return "NAV file not loaded yet"
+    last = state_get(sb, "nav:alerted_date")
+    if last == latest and not force:
+        return f"already alerted for {latest}"
+
+    rows = (sb.table("crm_manual_holdings").select("*")
+            .eq("owner_email", OWNER_EMAIL).execute().data or [])
+    value = day_move = base = 0.0
+    found = fresh = 0
+    clients = set()
+    movers = []                                          # (pct, fund name)
+    for r in rows:
+        ch = nav_mod.day_change(r.get("scheme_code"))
+        if not ch:
+            continue
+        found += 1
+        clients.add(r.get("client_id"))
+        units = float(r.get("units") or 0)
+        value += units * ch["nav"]
+        if ch["date"].isoformat() == latest:
+            fresh += 1
+        if ch["prev_nav"]:
+            day_move += units * (ch["nav"] - ch["prev_nav"])
+            base += units * ch["prev_nav"]
+            movers.append(((ch["nav"] - ch["prev_nav"]) / ch["prev_nav"] * 100,
+                           r.get("scheme_name") or r.get("scheme_code")))
+
+    if not found:
+        state_set(sb, "nav:alerted_date", latest)
+        return f"no holdings to report for {latest}"
+    if not force and fresh / found < NAV_READY_SHARE and now.hour < NAV_FALLBACK_HOUR:
+        return f"waiting: {fresh}/{found} holdings have the {latest} NAV"
+    if last is None and not force:
+        state_set(sb, "nav:alerted_date", latest)
+        return f"initialised ({latest}), no alert on first run"
+
+    d = datetime.fromisoformat(latest).strftime("%d %b %Y")
+    lines = [f"{found} holdings across {len(clients)} clients: {_inr(value)}."]
+    if base:
+        lines[0] = (f"{found} holdings across {len(clients)} clients: {_inr(value)} "
+                    f"({'+' if day_move >= 0 else ''}{_inr(day_move)}, {day_move / base * 100:+.2f}% today).")
+        movers.sort()
+        if len(movers) >= 2:
+            lines.append(f"Top: {movers[-1][1]} {movers[-1][0]:+.2f}%")
+            lines.append(f"Weakest: {movers[0][1]} {movers[0][0]:+.2f}%")
+    else:
+        lines.append("Daily change will show from the next update.")
+    result = send_to_email(sb, OWNER_EMAIL, f"NAV updated - {d}", "\n".join(lines),
+                           {"type": "nav", "date": latest}, kind="nav")
+    state_set(sb, "nav:alerted_date", latest)
+    return {"date": latest, "holdings": found, **result}
+
+
 def hourly_digest(sb, now, force: bool = False, quotes_fn=None, news_fn=None):
     hour_key = now.strftime("%Y-%m-%d %H")
     if not force and state_get(sb, "digest:last_hour") == hour_key:
@@ -275,12 +353,15 @@ def register_push(app, supabase_getter):
                      and DIGEST_FIRST_HOUR <= now.hour <= DIGEST_LAST_HOUR)
         result = {"time_ist": now.strftime("%a %d-%b %H:%M"),
                   "signal": "skipped (outside market hours)",
-                  "digest": "skipped (outside digest hours)"}
+                  "digest": "skipped (outside digest hours)",
+                  "nav": "skipped"}
         try:
             if job in ("all", "signal") and (in_market or force):
                 result["signal"] = check_signals(sb)
             if job in ("all", "digest") and (in_digest or force):
                 result["digest"] = hourly_digest(sb, now, force=force)
+            if job in ("all", "nav"):
+                result["nav"] = check_nav(sb, now=now, force=force)
         except push_service.PushConfigError as e:
             raise HTTPException(503, str(e))
         return result
