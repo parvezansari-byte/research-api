@@ -107,6 +107,7 @@ def parse_nse(payload) -> list:
             continue
         out[d] = {"date": d, "promoter": promoter, "public": public,
                   "other": _num(r.get("employeeTrusts")), "fii": None, "dii": None,
+                  "mf": None, "retail": None,
                   "xbrl": str(r.get("xbrl") or "") or None}
     return [out[k] for k in sorted(out, reverse=True)]
 
@@ -117,7 +118,7 @@ def with_changes(quarters: list) -> list:
     for i, q in enumerate(quarters):
         q = dict(q)
         older = quarters[i + 1] if i + 1 < len(quarters) else None
-        for key in ("promoter", "public"):
+        for key in ("promoter", "public", "fii", "dii"):
             a, b = q.get(key), (older or {}).get(key)
             q[key + "_chg"] = round(a - b, 2) if a is not None and b is not None else None
         res.append(q)
@@ -157,12 +158,12 @@ def _read(sb, symbol):
     return rows[0] if rows else None
 
 
-def _is_fresh(row, now) -> bool:
+def _is_fresh(row, now, ttl_days: float = TTL_DAYS) -> bool:
     try:
         at = datetime.fromisoformat(str(row["fetched_at"]).replace("Z", "+00:00"))
         if at.tzinfo is None:
             at = at.replace(tzinfo=timezone.utc)
-        return now - at < timedelta(days=TTL_DAYS)
+        return now - at < timedelta(days=ttl_days)
     except Exception:
         return False
 
@@ -175,16 +176,20 @@ def _shape(symbol, quarters, fetched_at, stale, error=None):
 
 
 def get_shareholding(sb, symbol: str, force: bool = False,
-                     fetcher: Callable = fetch_nse, now=None) -> dict:
+                     fetcher: Callable = fetch_nse, now=None, xml_fetch=None) -> dict:
     now = _now(now)
     cached = _read(sb, symbol)
     cached_q = ((cached or {}).get("data") or {}).get("quarters") or []
-    if cached and cached_q and not force and _is_fresh(cached, now):
+    # a newest quarter that has a filing link but no split yet is retried daily
+    missing_detail = bool(cached_q) and bool(cached_q[0].get("xbrl")) and cached_q[0].get("fii") is None
+    ttl = 1 if missing_detail else TTL_DAYS
+    if cached and cached_q and not force and _is_fresh(cached, now, ttl):
         return _shape(symbol, cached_q, cached["fetched_at"], False)
     try:
         quarters = parse_nse(fetcher(symbol))
         if not quarters:
             raise ShpError("no shareholding rows for this symbol")
+        enrich_with_detail(quarters, xml_fetch=xml_fetch)
     except ShpError as e:
         if cached_q:
             return _shape(symbol, cached_q, cached["fetched_at"], True, str(e))
@@ -221,15 +226,22 @@ XBRL_HOSTS = ("nsearchives.nseindia.com", "www.nseindia.com", "archives.nseindia
 XBRL_MAX_BYTES = 4_000_000
 
 
-def fetch_xbrl(url: str) -> bytes:
+def _session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+def fetch_xbrl(url: str, session=None) -> bytes:
     """Downloads one filing from NSE's archive. Only NSE hosts are allowed."""
     u = urlparse(url or "")
     if u.scheme != "https" or u.hostname not in XBRL_HOSTS:
         raise ShpError("filing link is not an NSE address")
-    s = requests.Session()
-    s.headers.update(HEADERS)
     try:
-        s.get(NSE_HOME, timeout=10)
+        if session is None:
+            session = _session()
+            session.get(NSE_HOME, timeout=10)
+        s = session
         r = s.get(url, headers={"Referer": NSE_REFERER}, timeout=30)
     except requests.RequestException as e:
         raise ShpError(f"could not download the filing: {e.__class__.__name__}")
@@ -268,6 +280,92 @@ def summarize_xbrl(xml_bytes: bytes, max_facts: int = 60) -> dict:
             "contexts": len(contexts),
             "context_members": sorted({m for ms in contexts.values() for _, m in ms})[:80],
             "percentage_facts": len(facts), "sample_facts": facts[:max_facts]}
+
+
+CAT_AXIS = "CategoryOfShareholdersAxis"
+PCT_TAG = "ShareholdingAsAPercentageOfTotalNumberOfShares"
+FOREIGN_PARTS = ("ForeignDirectInvestmentMember", "InstitutionsForeignPortfolioInvestorCategoryOneMember",
+                 "InstitutionsForeignPortfolioInvestorCategoryTwoMember", "OtherInstitutionsForeignMember")
+DOMESTIC_PARTS = ("MutualFundsOrUTIMember", "AlternativeInvestmentFundsMember", "BanksMember",
+                  "InsuranceCompaniesMember", "ProvidentFundsOrPensionFundsMember",
+                  "SovereignWealthFundsDomesticMember", "NBFCsRegisteredWithRBIMember",
+                  "OtherFinancialInstitutionsMember")
+RETAIL_MEMBER = "ResidentIndividualShareholdersHoldingNominalShareCapitalUpToRsTwoLakhMember"
+
+
+def parse_xbrl_categories(xml_bytes: bytes) -> dict:
+    """{category member name: raw shareholding value} for plain category rows only
+    (contexts with exactly the category axis, no typed members)."""
+    root = ET.fromstring(xml_bytes)
+    cat_of = {}
+    for c in root.iter():
+        if _local(c.tag) != "context":
+            continue
+        explicit = [m for m in c.iter() if _local(m.tag) == "explicitMember"]
+        typed = any(_local(m.tag) == "typedMember" for m in c.iter())
+        if typed or len(explicit) != 1:
+            continue
+        if not (explicit[0].get("dimension") or "").endswith(CAT_AXIS):
+            continue
+        cat_of[c.get("id")] = (explicit[0].text or "").strip().rsplit(":", 1)[-1]
+    out = {}
+    for e in root.iter():
+        if _local(e.tag) != PCT_TAG:
+            continue
+        member = cat_of.get(e.get("contextRef"))
+        val = _num(e.text)
+        if member and val is not None and member not in out:
+            out[member] = float(e.text.strip().replace(",", ""))
+    return out
+
+
+def split_from_categories(cat: dict, summary_promoter=None) -> Optional[dict]:
+    """Percent split {fii, dii, mf, retail}, or None if the filing doesn't add up."""
+    raw = cat.get("ShareholdingOfPromoterAndPromoterGroupMember")
+    if raw is None:
+        return None
+    scale = 100.0 if raw <= 1.5 else 1.0          # fractions (0.5044) or percent (50.44)
+    if summary_promoter is not None and abs(raw * scale - summary_promoter) > 0.15:
+        return None                                # does not match NSE's own summary
+
+    def pct(name):
+        v = cat.get(name)
+        return None if v is None else round(v * scale, 2)
+
+    def total(names):
+        vals = [cat[n] for n in names if cat.get(n) is not None]
+        return round(sum(vals) * scale, 2) if vals else None
+
+    fii = pct("InstitutionsForeignMember")
+    dii = pct("InstitutionsDomesticMember")
+    return {"fii": fii if fii is not None else total(FOREIGN_PARTS),
+            "dii": dii if dii is not None else total(DOMESTIC_PARTS),
+            "mf": pct("MutualFundsOrUTIMember"), "retail": pct(RETAIL_MEMBER)}
+
+
+def enrich_with_detail(quarters: list, xml_fetch=None, limit: int = 4, budget_s: float = 30.0) -> int:
+    """Fills fii / dii / mf / retail on the newest quarters from their full filings.
+    Never raises; a quarter that fails keeps null values. Returns how many worked."""
+    done, t0, session = 0, time.time(), None
+    for q in quarters[:limit]:
+        if not q.get("xbrl") or time.time() - t0 > budget_s:
+            continue
+        try:
+            if xml_fetch is None:
+                if session is None:
+                    session = _session()
+                    session.get(NSE_HOME, timeout=10)
+                data = fetch_xbrl(q["xbrl"], session)
+            else:
+                data = xml_fetch(q["xbrl"])
+            split = split_from_categories(parse_xbrl_categories(data), q.get("promoter"))
+        except (ShpError, ET.ParseError, requests.RequestException) as e:
+            logger.warning("filing detail failed for %s: %s", q.get("date"), e)
+            continue
+        if split:
+            q.update(split)
+            done += 1
+    return done
 
 
 def probe_xbrl(symbol: str, raw_fetch=None, xml_fetch=None) -> dict:

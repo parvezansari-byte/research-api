@@ -122,5 +122,73 @@ for bad in ("http://nsearchives.nseindia.com/a.xml", "https://evil.example.com/a
         check("blocks " + (bad or "empty link"), True)
 check("quarter keeps filing link", shp.parse_nse(with_link)[0]["xbrl"].endswith("x.xml"))
 
+# ---- category split from a filing shaped like NSE's real one (values are fractions)
+def _ctx(cid, member, typed=False):
+    inner = ('<xbrli:scenario><xbrldi:explicitMember dimension="in-bse-shp:CategoryOfShareholdersAxis">in-bse-shp:%s</xbrldi:explicitMember>%s</xbrli:scenario>'
+             % (member, '<xbrldi:typedMember dimension="in-bse-shp:Row"><x>1</x></xbrldi:typedMember>' if typed else ""))
+    return '<xbrli:context id="%s"><xbrli:entity><xbrli:identifier scheme="x">1</xbrli:identifier></xbrli:entity>%s</xbrli:context>' % (cid, inner)
+
+
+def _fact(cid, v):
+    return '<in-bse-shp:ShareholdingAsAPercentageOfTotalNumberOfShares contextRef="%s">%s</in-bse-shp:ShareholdingAsAPercentageOfTotalNumberOfShares>' % (cid, v)
+
+
+ROWS = {"ShareholdingOfPromoterAndPromoterGroupMember": 0.5044, "MutualFundsOrUTIMember": 0.1031,
+        "AlternativeInvestmentFundsMember": 0.0017, "BanksMember": 0.0005, "InsuranceCompaniesMember": 0.0947,
+        "ProvidentFundsOrPensionFundsMember": 0.0162, "SovereignWealthFundsDomesticMember": 0.0008,
+        "InstitutionsDomesticMember": 0.2172, "ForeignDirectInvestmentMember": 0.0017,
+        "InstitutionsForeignPortfolioInvestorCategoryOneMember": 0.1598,
+        "InstitutionsForeignPortfolioInvestorCategoryTwoMember": 0.0052,
+        "ResidentIndividualShareholdersHoldingNominalShareCapitalUpToRsTwoLakhMember": 0.0834}
+
+
+def build_xml(rows, with_decoy=True, extra=""):
+    ctx, facts = "", ""
+    for i, (m, v) in enumerate(rows.items()):
+        ctx += _ctx("C%d" % i, m); facts += _fact("C%d" % i, v)
+    if with_decoy:   # same member with a typed row: must be ignored
+        ctx += _ctx("D1", "ShareholdingOfPromoterAndPromoterGroupMember", typed=True); facts += _fact("D1", 0.0001)
+    return ('<?xml version="1.0"?><xbrli:xbrl xmlns:xbrli="http://www.xbrl.org/2003/instance" '
+            'xmlns:xbrldi="http://xbrl.org/2006/xbrldi" xmlns:in-bse-shp="http://x/shp">' + ctx + facts + extra + '</xbrli:xbrl>').encode()
+
+
+cat = shp.parse_xbrl_categories(build_xml(ROWS))
+check("typed-member decoy ignored", cat["ShareholdingOfPromoterAndPromoterGroupMember"] == 0.5044, str(cat))
+sp = shp.split_from_categories(cat, 50.44)
+check("split: dii from aggregate", sp["dii"] == 21.72, str(sp))
+check("split: fii summed from parts", sp["fii"] == 16.67, str(sp))
+check("split: mf and retail", sp["mf"] == 10.31 and sp["retail"] == 8.34, str(sp))
+rows2 = dict(ROWS, InstitutionsForeignMember=0.17)
+check("split: foreign aggregate preferred", shp.split_from_categories(shp.parse_xbrl_categories(build_xml(rows2)), 50.44)["fii"] == 17.0)
+check("split rejected when promoter disagrees with summary", shp.split_from_categories(cat, 40.0) is None)
+check("split rejected when no promoter row", shp.split_from_categories({"MutualFundsOrUTIMember": 0.1}) is None)
+pct_form = {k: v * 100 for k, v in ROWS.items()}
+check("percent-form values also work", shp.split_from_categories(pct_form, 50.44)["dii"] == 21.72)
+
+qs = [dict(date="2026-09-30", promoter=50.44, public=49.56, fii=None, dii=None, mf=None, retail=None, xbrl="https://nsearchives.nseindia.com/a.xml"),
+      dict(date="2026-06-30", promoter=50.48, public=49.52, fii=None, dii=None, mf=None, retail=None, xbrl="https://nsearchives.nseindia.com/b.xml"),
+      dict(date="2026-03-31", promoter=50.0, public=50.0, fii=None, dii=None, mf=None, retail=None, xbrl=None)]
+def xf(u):
+    if u.endswith("b.xml"):
+        raise ShpError("NSE answered 500")
+    return build_xml(ROWS)
+n = shp.enrich_with_detail(qs, xml_fetch=xf)
+check("enrich fills newest, survives a failed quarter", n == 1 and qs[0]["fii"] == 16.67 and qs[1]["fii"] is None and qs[2]["fii"] is None, str(qs))
+
+# end to end: get_shareholding enriches and caches; refreshes daily while detail is missing
+sb3 = FakeSb()
+rows_nse = [dict(SAMPLE[0], date="30-SEP-2026", pr_and_prgrp="50.44", public_val="49.56", xbrl="https://nsearchives.nseindia.com/a.xml")]
+r = shp.get_shareholding(sb3, "XYZ", fetcher=lambda s: rows_nse, now=t0, xml_fetch=lambda u: build_xml(ROWS))
+check("service returns fii/dii", r["latest"]["fii"] == 16.67 and r["latest"]["dii"] == 21.72, str(r["latest"]))
+calls2 = []
+shp.get_shareholding(sb3, "XYZ", fetcher=lambda s: calls2.append(1) or rows_nse, now=t0 + timedelta(days=5), xml_fetch=lambda u: build_xml(ROWS))
+check("detail cached for the full week", not calls2)
+sb4 = FakeSb()
+shp.get_shareholding(sb4, "XYZ", fetcher=lambda s: rows_nse, now=t0, xml_fetch=lambda u: (_ for _ in ()).throw(ShpError("down")))
+calls3 = []
+shp.get_shareholding(sb4, "XYZ", fetcher=lambda s: calls3.append(1) or rows_nse, now=t0 + timedelta(days=2), xml_fetch=lambda u: build_xml(ROWS))
+check("missing detail is retried after a day", len(calls3) == 1)
+check("change for fii", shp.with_changes([dict(date="b", fii=16.67), dict(date="a", fii=16.0)])[0]["fii_chg"] == 0.67)
+
 print("\n%d failure(s)" % len(failures))
 raise SystemExit(1 if failures else 0)
