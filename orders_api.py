@@ -409,5 +409,9 @@ def register_orders(app, supabase_getter):
     register_push(app, supabase_getter)
 
     # Signed login tokens + guard for email-scoped routes (see auth_guard.py).
+    # Shareholding pattern (see shareholding.py).
+    from shareholding import register_shareholding
+    register_shareholding(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
