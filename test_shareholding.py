@@ -92,5 +92,35 @@ check("probe reports keys", p["ok"] and p["rows"] == 4 and "pr_and_prgrp" in p["
 p = shp.probe("ABC", fetcher_raw=fetch_down)
 check("probe reports failure", p["ok"] is False and "403" in p["error"])
 
+# ---- full filing probe
+XML = b"""<?xml version="1.0"?>
+<xbrli:xbrl xmlns:xbrli="http://www.xbrl.org/2003/instance" xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+ xmlns:in-capmkt="http://x/in-capmkt">
+ <xbrli:context id="C1"><xbrli:entity><xbrli:segment>
+   <xbrldi:explicitMember dimension="in-capmkt:ShareholderCategoryAxis">in-capmkt:ForeignPortfolioInvestorsMember</xbrldi:explicitMember>
+ </xbrli:segment></xbrli:entity></xbrli:context>
+ <xbrli:context id="C2"><xbrli:entity><xbrli:segment>
+   <xbrldi:explicitMember dimension="in-capmkt:ShareholderCategoryAxis">in-capmkt:MutualFundsMember</xbrldi:explicitMember>
+ </xbrli:segment></xbrli:entity></xbrli:context>
+ <in-capmkt:ShareholdingAsAPercentageOfTotalNumberOfShares contextRef="C1">19.2</in-capmkt:ShareholdingAsAPercentageOfTotalNumberOfShares>
+ <in-capmkt:ShareholdingAsAPercentageOfTotalNumberOfShares contextRef="C2">6.1</in-capmkt:ShareholdingAsAPercentageOfTotalNumberOfShares>
+ <in-capmkt:NameOfCompany contextRef="C1">Sample</in-capmkt:NameOfCompany>
+</xbrli:xbrl>"""
+sm = shp.summarize_xbrl(XML)
+check("summary counts contexts and facts", sm["contexts"] == 2 and sm["percentage_facts"] == 2, str(sm))
+check("summary lists categories", "ForeignPortfolioInvestorsMember" in " ".join(sm["context_members"]) or any("Foreign" in m for m in sm["context_members"]))
+check("fact carries its category", sm["sample_facts"][0]["value"] == "19.2" and sm["sample_facts"][0]["members"])
+with_link = [dict(SAMPLE[0], xbrl="https://nsearchives.nseindia.com/corporate/xbrl/x.xml")]
+px = shp.probe_xbrl("ABC", raw_fetch=lambda s: with_link, xml_fetch=lambda u: XML)
+check("probe_xbrl ok", px["ok"] and px["percentage_facts"] == 2 and px["filing"].endswith("x.xml"), str(px))
+check("probe_xbrl no link", shp.probe_xbrl("ABC", raw_fetch=lambda s: SAMPLE)["ok"] is False)
+check("probe_xbrl bad xml", "not valid XML" in shp.probe_xbrl("ABC", raw_fetch=lambda s: with_link, xml_fetch=lambda u: b"<a>")["error"])
+for bad in ("http://nsearchives.nseindia.com/a.xml", "https://evil.example.com/a.xml", "https://nseindia.com.evil.io/a.xml", ""):
+    try:
+        shp.fetch_xbrl(bad); check("blocks " + bad, False)
+    except ShpError:
+        check("blocks " + (bad or "empty link"), True)
+check("quarter keeps filing link", shp.parse_nse(with_link)[0]["xbrl"].endswith("x.xml"))
+
 print("\n%d failure(s)" % len(failures))
 raise SystemExit(1 if failures else 0)

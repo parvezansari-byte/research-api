@@ -11,6 +11,7 @@ Routes (public data, no login needed):
   GET /shareholding/{symbol}?refresh=1    -> force a fresh fetch
   GET /shareholding-probe/{symbol}        -> what the exchange answered, raw
                                              (needs header X-Tick-Secret)
+  GET /shareholding-probe/{symbol}?xbrl=1 -> structure of the newest full filing
 
 Source: NSE "corporate-share-holdings-master". NSE blocks many cloud servers, so
 run the probe route from Render first. Fields that NSE's summary does not carry
@@ -20,6 +21,9 @@ import logging
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
+from collections import Counter
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
@@ -102,7 +106,8 @@ def parse_nse(payload) -> list:
         if d is None or (promoter is None and public is None):
             continue
         out[d] = {"date": d, "promoter": promoter, "public": public,
-                  "other": _num(r.get("employeeTrusts")), "fii": None, "dii": None}
+                  "other": _num(r.get("employeeTrusts")), "fii": None, "dii": None,
+                  "xbrl": str(r.get("xbrl") or "") or None}
     return [out[k] for k in sorted(out, reverse=True)]
 
 
@@ -211,6 +216,79 @@ def probe(symbol: str, fetcher_raw=None) -> dict:
     return info
 
 
+# --------------------------------------------------------------------------- full filing (XBRL)
+XBRL_HOSTS = ("nsearchives.nseindia.com", "www.nseindia.com", "archives.nseindia.com")
+XBRL_MAX_BYTES = 4_000_000
+
+
+def fetch_xbrl(url: str) -> bytes:
+    """Downloads one filing from NSE's archive. Only NSE hosts are allowed."""
+    u = urlparse(url or "")
+    if u.scheme != "https" or u.hostname not in XBRL_HOSTS:
+        raise ShpError("filing link is not an NSE address")
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    try:
+        s.get(NSE_HOME, timeout=10)
+        r = s.get(url, headers={"Referer": NSE_REFERER}, timeout=30)
+    except requests.RequestException as e:
+        raise ShpError(f"could not download the filing: {e.__class__.__name__}")
+    if r.status_code != 200:
+        raise ShpError(f"filing download answered {r.status_code}")
+    if len(r.content) > XBRL_MAX_BYTES:
+        raise ShpError("filing is larger than expected")
+    return r.content
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def summarize_xbrl(xml_bytes: bytes, max_facts: int = 60) -> dict:
+    """Describes the structure of a shareholding filing: tag names, the categories
+    (contexts) it uses, and sample percentage facts. Used to write the parser."""
+    root = ET.fromstring(xml_bytes)
+    tags = Counter(_local(e.tag) for e in root.iter())
+    contexts = {}
+    for c in root.iter():
+        if _local(c.tag) != "context":
+            continue
+        members = [(m.get("dimension", "").rsplit(":", 1)[-1], (m.text or "").strip())
+                   for m in c.iter() if _local(m.tag) == "explicitMember"]
+        contexts[c.get("id")] = members
+    facts = []
+    for e in root.iter():
+        name = _local(e.tag)
+        if "ercentage" in name and e.get("contextRef") and (e.text or "").strip():
+            facts.append({"tag": name, "context": e.get("contextRef"),
+                          "members": contexts.get(e.get("contextRef")),
+                          "value": (e.text or "").strip()})
+    return {"root": _local(root.tag), "bytes": len(xml_bytes),
+            "distinct_tags": len(tags), "top_tags": tags.most_common(40),
+            "contexts": len(contexts),
+            "context_members": sorted({m for ms in contexts.values() for _, m in ms})[:80],
+            "percentage_facts": len(facts), "sample_facts": facts[:max_facts]}
+
+
+def probe_xbrl(symbol: str, raw_fetch=None, xml_fetch=None) -> dict:
+    """Fetches the newest filing for a symbol and summarises it (never raises)."""
+    info = {"symbol": symbol, "ok": False}
+    try:
+        data = (raw_fetch or fetch_nse)(symbol)
+        quarters = parse_nse(data)
+        link = next((q["xbrl"] for q in quarters if q.get("xbrl")), None)
+        if not link:
+            raise ShpError("no filing link in NSE's rows")
+        info["filing"] = link
+        info.update(summarize_xbrl((xml_fetch or fetch_xbrl)(link)))
+        info["ok"] = True
+    except ShpError as e:
+        info["error"] = str(e)
+    except ET.ParseError as e:
+        info["error"] = f"filing is not valid XML: {e}"
+    return info
+
+
 def register_shareholding(app, supabase_getter):
     def _sb():
         try:
@@ -229,11 +307,11 @@ def register_shareholding(app, supabase_getter):
             raise HTTPException(502, f"Shareholding is not available right now ({e})")
 
     @app.get("/shareholding-probe/{symbol}")
-    def shareholding_probe(symbol: str, x_tick_secret: Optional[str] = Header(None)):
+    def shareholding_probe(symbol: str, xbrl: int = 0, x_tick_secret: Optional[str] = Header(None)):
         secret = os.environ.get("PUSH_TICK_SECRET", "")
         if not secret or x_tick_secret != secret:
             raise HTTPException(403, "Bad tick secret")
         sym = clean_symbol(symbol)
         if not SYMBOL_RE.match(sym):
             raise HTTPException(400, "Invalid stock symbol")
-        return probe(sym)
+        return probe_xbrl(sym) if xbrl else probe(sym)
