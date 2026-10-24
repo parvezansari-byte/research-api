@@ -25,6 +25,7 @@ Request JSON:
    "classes": {"equity": 50, "hybrid": 0, "debt": 50},            # optional, must add to 100
    "picks": {"equity": [{"name": "...", "weight": 40}, ...]}}     # optional, per class, max 5
 """
+import difflib
 import json
 import math
 import os
@@ -235,6 +236,116 @@ def invested(mode: str, amount: float, years: int) -> float:
     return amount if mode == "lumpsum" else amount * 12 * years
 
 
+# --------------------------------------------------------------------------- look-through
+HOLDINGS_FILE = os.path.join(HERE, "holdings_data.json")
+MILESTONE_YEARS = (5, 10, 15, 20)
+TOP_STOCKS, TOP_BONDS, TOP_SECTORS = 15, 10, 8
+_HOLD = None
+_RATING_START = re.compile(r"\s*(crisil|icra|care|ind|brickwork|fitch|acuite|sovereign|unrated)\b", re.I)
+_RATING_GRADE = re.compile(r"\b(AAA|AA[+-]?|A1\+?)(\b|$)")
+
+
+def _name_key(s: str) -> str:
+    s = (s or "").lower().replace("&", " and ")
+    s = re.split(r" - an? | \u2013 | \u2014 |\(an? ", s)[0]
+    s = re.sub(r"monthly|- \d+ \w+ \d{4}.*", "", s)
+    s = re.sub(r"\b(regular|direct|plan|growth|option|scheme|fund|the|of)\b", " ", s)
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", s).split())
+
+
+def _holdings_index() -> dict:
+    global _HOLD
+    if _HOLD is None:
+        try:
+            with open(HOLDINGS_FILE, encoding="utf-8") as fh:
+                rows = json.load(fh)
+        except (OSError, ValueError):
+            rows = []
+        _HOLD = {_name_key(r.get("fund", "")): r for r in rows if r.get("holdings")}
+    return _HOLD
+
+
+def find_holdings(fund_name: str) -> Optional[dict]:
+    idx = _holdings_index()
+    k = _name_key(fund_name)
+    if k in idx:
+        return idx[k]
+    near = difflib.get_close_matches(k, list(idx), 1, 0.9)
+    return idx[near[0]] if near else None
+
+
+def _is_bond(h: dict) -> bool:
+    name, sector = h.get("instrument") or "", h.get("sector") or ""
+    return bool(re.match(r"\s*[\d.]*\s*%", name) or "government of india" in name.lower()
+                or _RATING_START.match(sector) or _RATING_GRADE.search(sector))
+
+
+def _bond_issuer(name: str) -> str:
+    if re.search(r"\bgoi\b|government of india|\bg-?sec\b|\bgs\b", name or "", re.I):
+        return "Government of India (G-Sec)"
+    if re.search(r"treasury bill|t-bill|\btbill", name or "", re.I):
+        return "Treasury Bills"
+    n = re.sub(r"^\s*[\d.]*\s*%\s*", "", name or "")
+    n = re.sub(r"\(.*?\)", " ", n).replace("*", " ")
+    n = re.sub(r"\b(ncd|frn|zcb|sr|series)\b.*$", "", n, flags=re.I)
+    n = re.sub(r"[^\w.)]+$", "", " ".join(n.split()))
+    return n or (name or "Unknown")
+
+
+def _issuer_key(name: str) -> str:
+    n = name.lower().replace("limited", "ltd").replace("corporation", "corp")
+    k = re.sub(r"[^a-z0-9]", "", n)
+    for stem, alias in (("nationalbankforagri", "nabard"), ("smallindustriesdev", "sidbi")):
+        if k.startswith(stem):
+            return alias
+    return k
+
+
+def look_through(classes: list, amount: float) -> dict:
+    """Company-wise exposure: each fund's disclosed holdings scaled by its share of the whole plan."""
+    stocks, bonds, sectors = {}, {}, {}
+    covered, without, as_on = 0.0, [], ""
+    for c in classes:
+        for f in c["funds"]:
+            if f["weight"] <= 0 or f["share"] <= 0:
+                continue
+            rec = find_holdings(f["name"])
+            if not rec:
+                without.append(f["name"])
+                continue
+            covered += f["share"]
+            as_on = as_on or rec.get("as_on_date") or ""
+            for h in rec["holdings"]:
+                pct = _num(h.get("pct_nav"))
+                if not pct or pct <= 0:
+                    continue
+                part = f["share"] * pct / 100.0            # % of the whole plan
+                if _is_bond(h):
+                    name = _bond_issuer(h.get("instrument"))
+                    e = bonds.setdefault(_issuer_key(name), {"name": name, "rating": h.get("sector") or "", "pct": 0.0})
+                else:
+                    name = re.sub(r"[^\w.)]+$", "", (h.get("instrument") or "Unknown").strip())
+                    e = stocks.setdefault(h.get("isin") or name.lower(),
+                                          {"name": name, "sector": h.get("sector") or "", "pct": 0.0})
+                    sec = h.get("sector") or "Other"
+                    sectors[sec] = sectors.get(sec, 0.0) + part
+                e["pct"] += part
+
+    def rank(d, n):
+        rows = sorted(d.values(), key=lambda r: -r["pct"])[:n]
+        return [dict(r, pct=round(r["pct"], 2), amount=round(amount * r["pct"] / 100.0)) for r in rows]
+
+    return {
+        "stocks": rank(stocks, TOP_STOCKS), "bonds": rank(bonds, TOP_BONDS),
+        "sectors": [{"sector": k, "pct": round(v, 2)} for k, v in
+                    sorted(sectors.items(), key=lambda kv: -kv[1])[:TOP_SECTORS]],
+        "stocks_total": round(sum(r["pct"] for r in stocks.values()), 2),
+        "bonds_total": round(sum(r["pct"] for r in bonds.values()), 2),
+        "covered_pct": round(covered, 2), "without": without, "as_on": as_on,
+    }
+
+
+
 class FundPick(BaseModel):
     name: str
     weight: float = 0.0
@@ -362,13 +473,23 @@ def build_plan(req: PlanRequest) -> dict:
         series.append(row)
     end = series[-1]
     cats = sorted(by_category.values(), key=lambda c: -c["share"])
+    miles = []
+    for y in MILESTONE_YEARS:
+        b = vol / math.sqrt(y)
+        miles.append({"year": y, "invested": round(invested(mode, amount, y)),
+                      "low": round(future_value(mode, amount, max(-10.0, base - b), y)),
+                      "base": round(future_value(mode, amount, base, y)),
+                      "high": round(future_value(mode, amount, base + b, y))})
+    for m in miles:
+        m["gain"] = m["base"] - m["invested"]
 
     return {
         "mode": mode, "amount": amount, "years": years, "risk": risk, "auto": auto,
         "normalized": normalized, "classes": classes_out, "by_category": cats,
         "returns": {"portfolio": {"base": round(base, 2), "low": round(rates["low"], 2),
                                   "high": round(rates["high"], 2), "volatility": round(vol, 2)}},
-        "hypothetical": any_hyp, "projection": series,
+        "hypothetical": any_hyp, "projection": series, "milestones": miles,
+        "look_through": look_through(classes_out, amount),
         "summary": {"invested": end["invested"], "low": end["low"], "base": end["base"],
                     "high": end["high"], "gain_base": end["base"] - end["invested"]},
         "how": ("Class split from your risk profile and time horizon; one fund per category, "
@@ -662,6 +783,119 @@ def build_pdf(plan: dict, now: Optional[datetime] = None) -> bytes:
         pdf.cell(20, 5.2, lab)
         lx += 34
     pdf.ln(8)
+
+    # ---- value at 5 / 10 / 15 / 20 years
+    if pdf.get_y() > 215:
+        pdf.add_page()
+    section("Invested vs expected value")
+    bw = W / 4.0
+    y0 = pdf.get_y()
+    bh = 36.0
+    for i, m in enumerate(plan["milestones"]):
+        x = 12 + i * bw
+        pdf.set_draw_color(205, 218, 214)
+        pdf.set_fill_color(247, 250, 249)
+        pdf.set_line_width(0.3)
+        pdf.rect(x + 0.8, y0, bw - 1.6, bh, "DF")
+        pdf.set_xy(x + 3, y0 + 1.8)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(*VAULT)
+        pdf.cell(bw - 6, 5, f"{m['year']} years")
+        rows = [("Invested", _short(m["invested"]), MUTED), ("Expected", _short(m["base"]), GOLD),
+                ("Gain", ("+" if m["gain"] >= 0 else "") + _short(m["gain"]), LINE["high"]),
+                ("Range", _short(m["low"]) + " - " + _short(m["high"]), MUTED)]
+        for j, (lab, val, colr) in enumerate(rows):
+            yy = y0 + 8.5 + j * 6.6
+            pdf.set_xy(x + 3, yy)
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_text_color(*MUTED)
+            pdf.cell(14, 5, _s(lab))
+            pdf.set_xy(x + 15, yy)
+            pdf.set_font("Helvetica", "B" if lab in ("Expected", "Gain") else "", 8 if lab != "Range" else 6.5)
+            pdf.set_text_color(*colr)
+            pdf.cell(bw - 18, 5, _s(val), align="R")
+    pdf.set_y(y0 + bh + 2)
+    pdf.set_font("Helvetica", "", 7.5)
+    pdf.set_text_color(*MUTED)
+    pdf.multi_cell(W, 4, _s("Same mix and same expected return carried to each horizon" +
+                            (" (monthly SIP). " if plan["mode"] == "sip" else " (one-time investment). ") +
+                            "Range is one standard error either side of expected; it narrows as the horizon grows."),
+                   new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    # ---- company-wise look-through
+    lt = plan.get("look_through") or {}
+    section("Stock-wise and bond-wise (company-wise)")
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(*MUTED)
+    if not lt.get("stocks") and not lt.get("bonds"):
+        pdf.multi_cell(W, 4.5, _s("Company-level holdings are not available for the funds in this plan."),
+                       new_x="LMARGIN", new_y="NEXT")
+    else:
+        pdf.multi_cell(W, 4.2, _s(
+            f"Each fund's disclosed holdings scaled by its share of your plan. Covers {lt['covered_pct']:.0f}% of the plan"
+            + (f" (holdings as on {lt['as_on']})" if lt.get("as_on") else "") + "."),
+            new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+
+        def table(title, rows, second, total):
+            if not rows:
+                return
+            if pdf.get_y() > 245:
+                pdf.add_page()
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*VAULT)
+            pdf.cell(0, 6, _s(f"{title}  -  top {len(rows)} make up {total:.1f}% of the plan"),
+                     new_x="LMARGIN", new_y="NEXT")
+            cw = [90, 52, 18, 26]
+            pdf.set_fill_color(*VAULT)
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font("Helvetica", "B", 7.5)
+            for (lab, al), w in zip((("Company", "L"), (second, "L"), ("Of plan", "R"), ("Amount", "R")), cw):
+                pdf.cell(w, 5.6, lab, fill=True, align=al)
+            pdf.ln(5.6)
+            for i, r in enumerate(rows):
+                if pdf.get_y() > 272:
+                    pdf.add_page()
+                pdf.set_fill_color(*((244, 247, 246) if i % 2 else (255, 255, 255)))
+                pdf.set_text_color(*INK)
+                sub = r.get("sector") or r.get("rating") or ""
+                cells = [(r["name"], "L"), (sub, "L"), (_pc(r["pct"], 2), "R"),
+                         (_inr(r["amount"]) + per if r["amount"] else "-", "R")]
+                for (txt, al), w in zip(cells, cw):
+                    pdf.cell(w, 5.2, clip(txt, w, 7.5), fill=True, align=al)
+                pdf.ln(5.2)
+            pdf.ln(2)
+
+        table("Stocks", lt["stocks"], "Sector", lt["stocks_total"])
+        table("Bonds (by issuer)", lt["bonds"], "Rating", lt["bonds_total"])
+        if lt.get("sectors"):
+            if pdf.get_y() > 245:
+                pdf.add_page()
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*VAULT)
+            pdf.cell(0, 6, "Stock sectors", new_x="LMARGIN", new_y="NEXT")
+            for s_ in lt["sectors"]:
+                pdf.set_font("Helvetica", "", 8.5)
+                pdf.set_text_color(*INK)
+                pdf.cell(60, 5.2, clip(s_["sector"], 60, 8.5))
+                bx = pdf.get_x()
+                pdf.set_fill_color(228, 236, 233)
+                pdf.rect(bx, pdf.get_y() + 1.3, 70, 2.8, "F")
+                pdf.set_fill_color(*COL["equity"])
+                top = lt["sectors"][0]["pct"] or 1.0
+                pdf.rect(bx, pdf.get_y() + 1.3, max(0.6, 70 * s_["pct"] / top), 2.8, "F")
+                pdf.set_x(bx + 73)
+                pdf.cell(18, 5.2, _pc(s_["pct"], 2), align="R")
+                pdf.ln(5.2)
+        if lt.get("without"):
+            pdf.ln(1)
+            pdf.set_font("Helvetica", "", 7.5)
+            pdf.set_text_color(*MUTED)
+            names = ", ".join(n.replace(" - Regular Plan - Growth", "") for n in lt["without"])
+            pdf.multi_cell(W, 4, _s("Holdings not available for: " + names + ". Their share is not in the tables above."),
+                           new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
 
     # ---- notes
     section("Notes")
