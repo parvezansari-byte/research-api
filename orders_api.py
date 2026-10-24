@@ -413,5 +413,9 @@ def register_orders(app, supabase_getter):
     from shareholding import register_shareholding
     register_shareholding(app, supabase_getter)
 
+    # Auto allocation (see allocation_api.py).
+    from allocation_api import register_allocation
+    register_allocation(app)
+
     from auth_guard import register_guard
     register_guard(app)
