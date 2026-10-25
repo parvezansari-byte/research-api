@@ -161,3 +161,11 @@ def register_guard(app):
             STATS["blocked"] += 1
             return JSONResponse({"detail": problem[1]}, status_code=problem[0])
         return await call_next(request)
+
+    # The guard rebuilds some responses (login token, 401/403), and those bypass the CORS
+    # middleware that sits inside it. Browsers (the web build of the app) then see no
+    # Access-Control-Allow-Origin header and report "Failed to fetch". Adding CORS last
+    # makes it the outermost layer, so every response - including the guard's own - carries it.
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                       allow_methods=["*"], allow_headers=["*"])

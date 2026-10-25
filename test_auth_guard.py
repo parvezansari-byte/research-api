@@ -71,5 +71,27 @@ check("enforce: owner token ok on push", c.post("/push/test", headers={"Authoriz
 os.environ["AUTH_SECRET"] = ""
 check("enforce off if secret missing", not g.enforcing())
 
+# ---- browsers: every response, including the ones the guard rebuilds, carries CORS headers
+from fastapi.middleware.cors import CORSMiddleware
+os.environ["AUTH_SECRET"] = "x" * 32
+os.environ["AUTH_ENFORCE"] = "1"
+capp = FastAPI()
+capp.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+@capp.post("/auth/login")
+def clogin(b: dict): return {"email": b["email"], "name": "Pat"}
+@capp.get("/crm/{email}/clients")
+def cclients(email: str): return {"for": email}
+g.register_guard(capp)
+cc = TestClient(capp)
+O = {"Origin": "http://localhost:5555"}
+r = cc.post("/auth/login", json={"email": "a@b.com"}, headers=O)
+check("login returns a token", r.status_code == 200 and "token" in r.json())
+check("login response has CORS header", r.headers.get("access-control-allow-origin") in ("*", "http://localhost:5555"))
+r = cc.get("/crm/a@b.com/clients", headers=O)
+check("guard 401 has CORS header", r.status_code == 401 and r.headers.get("access-control-allow-origin") in ("*", "http://localhost:5555"))
+r = cc.options("/auth/login", headers={**O, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "content-type,authorization"})
+check("preflight allowed", r.status_code == 200 and "access-control-allow-origin" in r.headers)
+os.environ.pop("AUTH_ENFORCE", None)
+
 print("\nALL PASSED" if not fails else f"\nFAILED: {fails}")
 raise SystemExit(1 if fails else 0)
