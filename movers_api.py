@@ -30,7 +30,8 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": NSE_HOME + "/market-data/live-equity-market",
 }
-INDICES = ["NIFTY 50", "NIFTY NEXT 50", "NIFTY MIDCAP 100", "NIFTY SMALLCAP 100", "NIFTY 500"]
+INDICES = ["NIFTY 50", "NIFTY NEXT 50", "NIFTY MIDCAP 100", "NIFTY MIDCAP 150", "NIFTY SMALLCAP 100",
+           "NIFTY SMALLCAP 250", "NIFTY 500"]
 DEFAULT_INDEX = "NIFTY 500"
 MAX_N = 25
 FRESH_S = 180
@@ -87,7 +88,8 @@ def parse_movers(payload, index: str, n: int = 10) -> dict:
     ranked = sorted(stocks, key=lambda s: s["change_pct"], reverse=True)
     gainers = [s for s in ranked if s["change_pct"] > 0][:n]
     losers = [s for s in reversed(ranked) if s["change_pct"] < 0][:n]
-    return {"index": index, "as_of": str(payload.get("timestamp") or ""), "source": "NSE",
+    return {"index": index, "as_of": str(payload.get("timestamp") or ""),
+            "source": payload.get("_source") or "NSE", "note": payload.get("_note") or "",
             "count": len(stocks), "gainers": gainers, "losers": losers, "stocks": ranked}
 
 
@@ -107,12 +109,116 @@ def fetch_nse(index: str) -> dict:
         raise MoversError("NSE did not return JSON")
 
 
+# --------------------------------------------------------------------------- Yahoo fallback
+# When NSE refuses (it answered 404 from Render), the stock list for the index comes from the
+# constituent lists already in this project, priced through Yahoo Finance.
+_LIST_FILES = {"large": "nse_largecap_sectors.csv", "mid": "nse_midcap_sectors.csv",
+               "small": "nse_smallcap_sectors.csv"}
+_APPROX = {      # index -> (what the fallback list really is)
+    "NIFTY MIDCAP 100": "Midcap 150", "NIFTY SMALLCAP 100": "Smallcap 250",
+}
+
+
+def _csv_symbols(kind: str) -> list:
+    out = []
+    try:
+        with open(os.path.join(HERE, _LIST_FILES[kind]), encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                s = (row.get("Symbol") or row.get("SYMBOL") or "").strip().upper()
+                if s:
+                    out.append(s)
+    except OSError:
+        pass
+    return out
+
+
+def constituents(index: str) -> list:
+    index = index.upper()
+    if index in ("NIFTY 50", "NIFTY NEXT 50"):
+        try:
+            import analysis_api
+            return list(analysis_api._FALLBACK["NIFTY50" if index == "NIFTY 50" else "NIFTYNEXT50"])
+        except Exception:
+            return []
+    if index in ("NIFTY MIDCAP 100", "NIFTY MIDCAP 150"):
+        return _csv_symbols("mid")
+    if index in ("NIFTY SMALLCAP 100", "NIFTY SMALLCAP 250"):
+        return _csv_symbols("small")
+    if index == "NIFTY 500":
+        seen, out = set(), []
+        for s in _csv_symbols("large") + _csv_symbols("mid") + _csv_symbols("small"):
+            if s not in seen:
+                seen.add(s); out.append(s)
+        return out
+    return []
+
+
+def fetch_yahoo_history(symbols: list) -> dict:
+    """symbol -> [(date, close)] for the last few sessions."""
+    import yfinance as yf
+    out = {}
+    for i in range(0, len(symbols), 120):               # chunks keep each Yahoo request modest
+        chunk = symbols[i:i + 120]
+        tickers = [f"{s}.NS" for s in chunk]
+        try:
+            df = yf.download(tickers, period="5d", interval="1d", group_by="ticker",
+                             progress=False, auto_adjust=False, threads=True)
+        except Exception as e:
+            log.warning("yahoo chunk failed: %s", e)
+            continue
+        for s, tk in zip(chunk, tickers):
+            try:
+                col = df[tk]["Close"] if len(tickers) > 1 else df["Close"]
+                rows = [(ts.strftime("%Y-%m-%d"), float(c)) for ts, c in col.dropna().items()]
+                if len(rows) >= 2:
+                    out[s] = rows
+            except Exception:
+                continue
+    return out
+
+
+def yahoo_payload(index: str, history_fetch: Optional[Callable] = None) -> dict:
+    """An NSE-shaped payload built from Yahoo prices, so parse_movers can read it unchanged."""
+    syms = constituents(index)
+    if not syms:
+        raise MoversError("no constituent list available for this index")
+    hist = (history_fetch or fetch_yahoo_history)(syms)
+    rows = []
+    for s, h in hist.items():
+        if len(h) < 2:
+            continue
+        last, prev = h[-1][1], h[-2][1]
+        if last > 0 and prev > 0:
+            rows.append({"symbol": s, "lastPrice": last, "change": last - prev,
+                         "pChange": (last - prev) / prev * 100})
+    if not rows:
+        raise MoversError("Yahoo returned no prices")
+    note = "Prices are delayed (Yahoo Finance) because NSE's live list is unavailable."
+    if index in _APPROX:
+        note += f" The list shown is {_APPROX[index]}, the closest index we can price."
+    return {"timestamp": max(h[-1][0] for h in hist.values() if h), "data": rows, "_source": "Yahoo", "_note": note}
+
+
+def fetch_best(index: str) -> dict:
+    """NSE first; if NSE refuses, Yahoo."""
+    try:
+        return fetch_nse(index)
+    except MoversError as e:
+        nse_reason = str(e)
+    try:
+        return yahoo_payload(index)
+    except MoversError as e:
+        raise MoversError(f"{nse_reason}; fallback: {e}")
+    except Exception as e:
+        raise MoversError(f"{nse_reason}; fallback failed: {e.__class__.__name__}")
+
+
 def _load(index: str, fetcher, now) -> tuple:
     """(full data for the index, stale?) from cache or NSE."""
     index = (index or DEFAULT_INDEX).strip().upper()
     if index not in INDICES:
         raise HTTPException(400, "index must be one of: " + ", ".join(INDICES))
-    fetcher = fetcher or fetch_nse
+    fetcher = fetcher or fetch_best
     t = time.time() if now is None else now
     hit = _cache.get(index)
     if hit and t - hit["at"] < FRESH_S:
@@ -149,7 +255,8 @@ def get_index_stocks(index: str = DEFAULT_INDEX, fetcher: Optional[Callable[[str
     falling = sum(1 for s in data["stocks"] if s["change_pct"] < 0)
     return {"index": data["index"], "as_of": data["as_of"], "count": data["count"], "rising": rising,
             "falling": falling, "unchanged": data["count"] - rising - falling,
-            "stocks": data["stocks"], "stale": stale}
+            "stocks": data["stocks"], "stale": stale, "source": data.get("source", "NSE"),
+            "note": data.get("note", "")}
 
 
 def register_movers(app):

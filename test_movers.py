@@ -103,5 +103,41 @@ mm.fetch_nse("NIFTY 50")
 check("NSE URL encodes the space as %20, not +", seen["url"].endswith("?index=NIFTY%2050"))
 r = TestClient(app).get("/market/index-stocks", params={"index": "NIFTY 50"})
 check("HTTP index-stocks", r.status_code == 200 and r.json()["count"] == 5)
+
+# ---- Yahoo fallback when NSE refuses
+import movers_api as mv
+check("constituents: Nifty 50 has 50", len(mv.constituents("NIFTY 50")) == 50)
+check("constituents: Nifty 500 is the three lists, no duplicates", 480 <= len(mv.constituents("NIFTY 500")) <= 520 and len(set(mv.constituents("NIFTY 500"))) == len(mv.constituents("NIFTY 500")))
+check("constituents: midcap and smallcap lists load", len(mv.constituents("NIFTY MIDCAP 150")) > 100 and len(mv.constituents("NIFTY SMALLCAP 250")) > 200)
+check("constituents: unknown index empty", mv.constituents("X") == [])
+HIST = {"AAA": [("2026-10-26", 100.0), ("2026-10-27", 103.0)], "BBB": [("2026-10-26", 50.0), ("2026-10-27", 48.0)],
+        "CCC": [("2026-10-27", 10.0)], "DDD": [("2026-10-26", 0.0), ("2026-10-27", 5.0)]}
+pay = mv.yahoo_payload("NIFTY 50", history_fetch=lambda syms: HIST)
+parsed = mv.parse_movers(pay, "NIFTY 50", 10)
+check("Yahoo payload parses like NSE's", [s["symbol"] for s in parsed["gainers"]] == ["AAA"] and [s["symbol"] for s in parsed["losers"]] == ["BBB"])
+check("source and note carried", parsed["source"] == "Yahoo" and "delayed" in parsed["note"])
+check("midcap 100 note says which list is shown", "Midcap 150" in mv.yahoo_payload("NIFTY MIDCAP 100", history_fetch=lambda s: HIST)["_note"])
+try:
+    mv.yahoo_payload("NIFTY 50", history_fetch=lambda syms: {}); ok = False
+except mv.MoversError:
+    ok = True
+check("Yahoo with nothing -> MoversError", ok)
+
+orig_nse, orig_y = mv.fetch_nse, mv.yahoo_payload
+mv.fetch_nse = lambda idx: (_ for _ in ()).throw(mv.MoversError("NSE answered 404"))
+mv.yahoo_payload = lambda idx, history_fetch=None: pay
+check("fetch_best falls back to Yahoo when NSE fails", mv.fetch_best("NIFTY 50")["_source"] == "Yahoo")
+mv.yahoo_payload = lambda idx, history_fetch=None: (_ for _ in ()).throw(mv.MoversError("Yahoo returned no prices"))
+try:
+    mv.fetch_best("NIFTY 50"); ok = False
+except mv.MoversError as e:
+    ok = "404" in str(e) and "Yahoo returned no prices" in str(e)
+check("both failing reports both reasons", ok)
+mv.fetch_nse = lambda idx: PAYLOAD
+check("fetch_best uses NSE when it works", mv.fetch_best("NIFTY 50")["timestamp"] == PAYLOAD["timestamp"])
+mv.fetch_nse, mv.yahoo_payload = orig_nse, orig_y
+mv._cache.clear()
+full = mv.get_index_stocks("NIFTY 50", lambda idx: pay, now=1.0)
+check("index-stocks passes the source and note through", full["source"] == "Yahoo" and "delayed" in full["note"])
 print("\nALL PASSED" if not fails else f"\nFAILED: {fails}")
 raise SystemExit(1 if fails else 0)
