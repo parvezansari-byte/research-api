@@ -417,5 +417,9 @@ def register_orders(app, supabase_getter):
     from allocation_api import register_allocation
     register_allocation(app)
 
+    # Market breadth (see breadth_api.py).
+    from breadth_api import register_breadth
+    register_breadth(app)
+
     from auth_guard import register_guard
     register_guard(app)
