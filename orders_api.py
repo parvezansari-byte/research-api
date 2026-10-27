@@ -425,5 +425,9 @@ def register_orders(app, supabase_getter):
     from movers_api import register_movers
     register_movers(app)
 
+    # Index price history for the tap-to-chart screen (see index_history_api.py).
+    from index_history_api import register_index_history
+    register_index_history(app)
+
     from auth_guard import register_guard
     register_guard(app)
