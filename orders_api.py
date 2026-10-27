@@ -421,5 +421,9 @@ def register_orders(app, supabase_getter):
     from breadth_api import register_breadth
     register_breadth(app)
 
+    # Top gainers and losers (see movers_api.py).
+    from movers_api import register_movers
+    register_movers(app)
+
     from auth_guard import register_guard
     register_guard(app)
