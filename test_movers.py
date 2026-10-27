@@ -68,5 +68,40 @@ c = TestClient(app)
 r = c.get("/market/movers", params={"index": "NIFTY 50", "n": 5})
 check("HTTP 200", r.status_code == 200 and r.json()["gainers"][0]["symbol"] == "INFY")
 check("HTTP 400 on bad index", c.get("/market/movers", params={"index": "X"}).status_code == 400)
+
+# ---- full stock list for an index
+m._cache.clear()
+full = m.get_index_stocks("nifty 50", good, now=100.0)
+check("index-stocks lists every stock, best first", [s["symbol"] for s in full["stocks"]] == ["INFY", "RELIANCE", "ITC", "TCS", "HDFCBANK"])
+check("index-stocks counts", (full["rising"], full["falling"], full["unchanged"], full["count"]) == (2, 2, 1, 5))
+calls2 = []
+def good2(idx): calls2.append(idx); return PAYLOAD
+m._cache.clear()
+m.get_movers("NIFTY 50", 3, good2, now=1.0)
+m.get_index_stocks("NIFTY 50", good2, now=2.0)
+check("movers and index-stocks share one NSE call", len(calls2) == 1)
+check("movers reply stays small (no full list)", "stocks" not in m.get_movers("NIFTY 50", 3, good2, now=3.0))
+try:
+    m.get_index_stocks("BANKNIFTY", good2); ok = False
+except HTTPException as e:
+    ok = e.status_code == 400
+check("index-stocks validates the index", ok)
+# NSE URL keeps %20 for spaces
+seen = {}
+class FakeSession:
+    def __init__(self): self.headers = {}
+    def get(self, url, **kw):
+        seen["url"] = url
+        class R: status_code = 200
+        R.json = staticmethod(lambda: PAYLOAD)
+        return R
+import importlib.util
+spec = importlib.util.spec_from_file_location("movers_real", m.__file__)
+mm = importlib.util.module_from_spec(spec); spec.loader.exec_module(mm)      # fresh copy with the real fetch_nse
+mm.requests.Session = FakeSession
+mm.fetch_nse("NIFTY 50")
+check("NSE URL encodes the space as %20, not +", seen["url"].endswith("?index=NIFTY%2050"))
+r = TestClient(app).get("/market/index-stocks", params={"index": "NIFTY 50"})
+check("HTTP index-stocks", r.status_code == 200 and r.json()["count"] == 5)
 print("\nALL PASSED" if not fails else f"\nFAILED: {fails}")
 raise SystemExit(1 if fails else 0)

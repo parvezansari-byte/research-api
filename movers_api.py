@@ -2,6 +2,7 @@
 movers_api.py - top gainers and losers for the Markets screen.
 
     GET /market/movers?index=NIFTY 500&n=10
+    GET /market/index-stocks?index=NIFTY 50       every stock in the index, best first
 
 Source: NSE's equity-stockIndices feed (live price and % change for each index member).
 Public route. Cached per index for 3 minutes; if NSE fails the last good answer (up to
@@ -11,6 +12,7 @@ import csv
 import logging
 import os
 import time
+from urllib.parse import quote
 from typing import Callable, Optional
 
 import requests
@@ -86,7 +88,7 @@ def parse_movers(payload, index: str, n: int = 10) -> dict:
     gainers = [s for s in ranked if s["change_pct"] > 0][:n]
     losers = [s for s in reversed(ranked) if s["change_pct"] < 0][:n]
     return {"index": index, "as_of": str(payload.get("timestamp") or ""), "source": "NSE",
-            "count": len(stocks), "gainers": gainers, "losers": losers}
+            "count": len(stocks), "gainers": gainers, "losers": losers, "stocks": ranked}
 
 
 def fetch_nse(index: str) -> dict:
@@ -94,7 +96,7 @@ def fetch_nse(index: str) -> dict:
     s.headers.update(HEADERS)
     try:
         s.get(NSE_HOME, timeout=10)
-        r = s.get(NSE_URL, params={"index": index}, timeout=15)
+        r = s.get(NSE_URL + "?index=" + quote(index, safe=""), timeout=15)
     except requests.RequestException as e:
         raise MoversError(f"could not reach NSE: {e.__class__.__name__}")
     if r.status_code != 200:
@@ -105,38 +107,56 @@ def fetch_nse(index: str) -> dict:
         raise MoversError("NSE did not return JSON")
 
 
-def get_movers(index: str = DEFAULT_INDEX, n: int = 10,
-               fetcher: Optional[Callable[[str], dict]] = None, now: Optional[float] = None) -> dict:
+def _load(index: str, fetcher, now) -> tuple:
+    """(full data for the index, stale?) from cache or NSE."""
     index = (index or DEFAULT_INDEX).strip().upper()
     if index not in INDICES:
         raise HTTPException(400, "index must be one of: " + ", ".join(INDICES))
-    if not 1 <= n <= MAX_N:
-        raise HTTPException(400, f"n must be between 1 and {MAX_N}")
     fetcher = fetcher or fetch_nse
     t = time.time() if now is None else now
     hit = _cache.get(index)
-
-    def cut(d, stale):
-        return dict(d, gainers=d["gainers"][:n], losers=d["losers"][:n], stale=stale)
-
     if hit and t - hit["at"] < FRESH_S:
-        return cut(hit["data"], False)
+        return hit["data"], False
     try:
         data = parse_movers(fetcher(index), index, MAX_N)
     except MoversError as e:
         if hit and t - hit["at"] < STALE_S:
-            return cut(hit["data"], True)
+            return hit["data"], True
         raise HTTPException(503, f"Top movers are unavailable: {e}")
     except Exception as e:
         log.warning("movers failed: %s", e)
         if hit and t - hit["at"] < STALE_S:
-            return cut(hit["data"], True)
+            return hit["data"], True
         raise HTTPException(503, "Top movers are unavailable")
     _cache[index] = {"at": t, "data": data}
-    return cut(data, False)
+    return data, False
+
+
+def get_movers(index: str = DEFAULT_INDEX, n: int = 10,
+               fetcher: Optional[Callable[[str], dict]] = None, now: Optional[float] = None) -> dict:
+    if not 1 <= n <= MAX_N:
+        raise HTTPException(400, f"n must be between 1 and {MAX_N}")
+    data, stale = _load(index, fetcher, now)
+    out = {k: v for k, v in data.items() if k != "stocks"}
+    return dict(out, gainers=data["gainers"][:n], losers=data["losers"][:n], stale=stale)
+
+
+def get_index_stocks(index: str = DEFAULT_INDEX, fetcher: Optional[Callable[[str], dict]] = None,
+                     now: Optional[float] = None) -> dict:
+    """Every stock in the index with price and day change, best performer first."""
+    data, stale = _load(index, fetcher, now)
+    rising = sum(1 for s in data["stocks"] if s["change_pct"] > 0)
+    falling = sum(1 for s in data["stocks"] if s["change_pct"] < 0)
+    return {"index": data["index"], "as_of": data["as_of"], "count": data["count"], "rising": rising,
+            "falling": falling, "unchanged": data["count"] - rising - falling,
+            "stocks": data["stocks"], "stale": stale}
 
 
 def register_movers(app):
     @app.get("/market/movers")
     def market_movers(index: str = DEFAULT_INDEX, n: int = 10):
         return get_movers(index, n)
+
+    @app.get("/market/index-stocks")
+    def market_index_stocks(index: str = DEFAULT_INDEX):
+        return get_index_stocks(index)
