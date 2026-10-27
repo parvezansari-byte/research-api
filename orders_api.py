@@ -429,5 +429,9 @@ def register_orders(app, supabase_getter):
     from index_history_api import register_index_history
     register_index_history(app)
 
+    # Watchlist quotes (see watchlist_api.py).
+    from watchlist_api import register_watchlist
+    register_watchlist(app)
+
     from auth_guard import register_guard
     register_guard(app)
