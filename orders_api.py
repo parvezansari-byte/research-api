@@ -433,5 +433,9 @@ def register_orders(app, supabase_getter):
     from watchlist_api import register_watchlist
     register_watchlist(app)
 
+    # Mutual fund portfolio review (see portfolio_review_api.py).
+    from portfolio_review_api import register_portfolio_review
+    register_portfolio_review(app)
+
     from auth_guard import register_guard
     register_guard(app)
