@@ -437,5 +437,9 @@ def register_orders(app, supabase_getter):
     from portfolio_review_api import register_portfolio_review
     register_portfolio_review(app)
 
+    # Dhan holdings valued at live prices (see dhan_portfolio_api.py).
+    from dhan_portfolio_api import register_dhan_portfolio
+    register_dhan_portfolio(app)
+
     from auth_guard import register_guard
     register_guard(app)
