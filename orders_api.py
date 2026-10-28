@@ -449,5 +449,9 @@ def register_orders(app, supabase_getter):
     from review_watch_api import register_review_watch
     register_review_watch(app, supabase_getter)
 
+    # Client book overview (see book_summary_api.py).
+    from book_summary_api import register_book_summary
+    register_book_summary(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
