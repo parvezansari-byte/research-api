@@ -10,74 +10,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import nse_service
+from fake_supabase import FakeSb
 from orders_api import register_orders
-
-
-class FakeResult:
-    def __init__(self, data):
-        self.data = data
-
-
-class FakeQuery:
-    def __init__(self, db, name):
-        self.db, self.name = db, name
-        self.rows = db.tables.setdefault(name, [])
-        self.filters, self.mode, self.payload = [], "select", None
-        self.order_by = None
-
-    def select(self, *_):
-        self.mode = "select"
-        return self
-
-    def eq(self, col, val):
-        self.filters.append((col, val))
-        return self
-
-    def order(self, col, desc=False):
-        self.order_by = (col, desc)
-        return self
-
-    def insert(self, row):
-        self.mode, self.payload = "insert", row
-        return self
-
-    def update(self, fields):
-        self.mode, self.payload = "update", fields
-        return self
-
-    def _match(self):
-        return [r for r in self.rows if all(r.get(c) == v for c, v in self.filters)]
-
-    def execute(self):
-        if self.mode == "insert":
-            row = dict(self.payload)
-            if self.name == "crm_orders":
-                for r in self.rows:
-                    if (r["owner_email"], r["idempotency_key"]) == (
-                            row["owner_email"], row["idempotency_key"]):
-                        raise Exception("duplicate key value violates unique constraint")
-            row["id"] = len(self.rows) + 1
-            row.setdefault("created_at", datetime.now(timezone.utc).isoformat())
-            self.rows.append(row)
-            return FakeResult([dict(row)])
-        if self.mode == "update":
-            hit = self._match()
-            for r in hit:
-                r.update(self.payload)
-            return FakeResult([dict(r) for r in hit])
-        out = [dict(r) for r in self._match()]
-        if self.order_by:
-            col, desc = self.order_by
-            out.sort(key=lambda r: str(r.get(col)), reverse=desc)
-        return FakeResult(out)
-
-
-class FakeSb:
-    def __init__(self):
-        self.tables = {}
-
-    def table(self, name):
-        return FakeQuery(self, name)
+import holdings_api
 
 
 OWNER = "adv@example.com"
@@ -87,6 +22,12 @@ sb.tables["crm_clients"] = [
     {"id": 2, "owner_email": OWNER, "kyc_status": "PENDING", "nse_client_code": None},
     {"id": 3, "owner_email": "other@example.com", "kyc_status": "KYC_VALIDATED"},
 ]
+sb.tables["crm_manual_holdings"] = [
+    {"id": 1, "owner_email": OWNER, "client_id": 1, "scheme_code": "119551",
+     "scheme_name": "Test Fund - Regular - Growth", "folio_number": "", "units": 100.0, "avg_nav": 40.0},
+]
+NAV = {"value": (50.0, "07-10-2026")}
+holdings_api.fetch_nav = lambda code: NAV["value"]
 app = FastAPI()
 register_orders(app, lambda: sb)
 http = TestClient(app)
@@ -163,6 +104,38 @@ check("redeem both amount+units rejected", post(order_type="REDEEM", amount=1000
 check("redeem neither rejected", post(order_type="REDEEM", amount=None).status_code == 400)
 r = post(order_type="REDEEM", amount=None, units=12.5)
 check("redeem by units placed", r.status_code == 200 and r.json()["units"] == 12.5 and r.json()["amount"] is None, r.text)
+
+# 6b redemption vs holdings (100 units held, NAV 50)
+open_redeem = lambda: [o for o in sb.tables["crm_orders"] if o["order_type"] == "REDEEM"
+                       and o["status"] not in ("ALLOTTED", "FAILED", "CANCELLED")]
+for o in sb.tables["crm_orders"]:      # settle everything placed so far
+    o["status"] = "ALLOTTED"
+r = post(order_type="REDEEM", amount=None, units=150)
+check("redeem more units than held -> 409", r.status_code == 409 and "100.000" in r.text, r.text)
+r = post(order_type="REDEEM", amount=6000)
+check("redeem amount worth more than held -> 409", r.status_code == 409, r.text)
+r = post(order_type="REDEEM", amount=1000, scheme_code="999999", scheme_name="Other Fund")
+check("redeem fund with no holding -> 409", r.status_code == 409 and "Holdings" in r.text, r.text)
+r = post(client_id=2, order_type="REDEEM", amount=None, units=1)
+check("pending-KYC client still blocked first", r.status_code == 409 and "KYC" in r.text, r.text)
+r = post(order_type="REDEEM", amount=3000)       # 60 units at NAV 50
+first = r.json()
+check("redeem within holding placed", r.status_code == 200 and first["status"] == "SUBMITTED", r.text)
+r = post(order_type="REDEEM", amount=None, units=50)  # 60 pending + 50 > 100
+check("open redemption reserves units -> 409", r.status_code == 409 and "open redemption" in r.text, r.text)
+r = post(order_type="REDEEM", amount=None, units=40)  # exactly the remaining 40
+check("remaining units can be redeemed", r.status_code == 200, r.text)
+for o in sb.tables["crm_orders"]:
+    o["status"] = "CANCELLED" if o["order_type"] == "REDEEM" else o["status"]
+NAV["value"] = None
+r = post(order_type="REDEEM", amount=1000)
+check("amount redemption without NAV -> 503", r.status_code == 503, r.text)
+r = post(order_type="REDEEM", amount=None, units=5)
+check("units redemption works without NAV", r.status_code == 200, r.text)
+NAV["value"] = (50.0, "07-10-2026")
+for o in sb.tables["crm_orders"]:
+    if o["order_type"] == "REDEEM":
+        o["status"] = "ALLOTTED"
 
 # 7 simulated rejection
 r = post(amount=111)
