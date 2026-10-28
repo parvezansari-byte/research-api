@@ -780,6 +780,124 @@ class CompareRequest(BaseModel):
     names: List[str]
 
 
+# --------------------------------------------------------------------------- rebalance
+BAND_PP = 5.0
+CLASS_OF = {"Equity": "equity", "Hybrid": "hybrid", "Debt": "debt"}
+
+
+class RebalanceRequest(BaseModel):
+    holdings: List[Holding]
+    risk: str = "balanced"
+    years: int = 10
+    target: Optional[dict] = None       # {"equity": 60, "hybrid": 10, "debt": 30}; blank = model mix
+    new_money: float = 0
+
+
+def _status(diff_pp: float) -> str:
+    return "On target" if abs(diff_pp) <= BAND_PP else ("Above target" if diff_pp > 0 else "Below target")
+
+
+def build_rebalance(req: RebalanceRequest, today: Optional[date] = None) -> dict:
+    if req.risk not in al.BASE_SPLIT:
+        raise HTTPException(400, "risk must be conservative, balanced or aggressive")
+    if not 1 <= req.years <= 40:
+        raise HTTPException(400, "years must be between 1 and 40")
+    if not (math.isfinite(req.new_money) and 0 <= req.new_money <= 1e10):
+        raise HTTPException(400, "new money must be 0 or more")
+    rev = build_review(req.holdings, today)
+    rows = rev["holdings"]
+    core = {c: 0.0 for c in al.CLASSES}
+    other = 0.0
+    for r in rows:
+        c = CLASS_OF.get(r["asset_class"])
+        if c:
+            core[c] += r["current"]
+        else:
+            other += r["current"]
+    core_total = sum(core.values())
+    if core_total <= 0:
+        raise HTTPException(400, "Rebalancing needs at least one equity, hybrid or debt fund with a current value")
+
+    if req.target:
+        try:
+            tgt = {c: float(req.target.get(c, 0) or 0) for c in al.CLASSES}
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Target percentages must be numbers")
+        if any(v < 0 or not math.isfinite(v) for v in tgt.values()) or abs(sum(tgt.values()) - 100) > 0.6:
+            raise HTTPException(400, "Target percentages must be 0 or more and add up to 100")
+        source = "Your own target"
+    else:
+        tgt = {k: float(v) for k, v in al.auto_split(req.risk, req.years).items()}
+        source = f"Model mix for a {req.risk} investor with a {req.years} year horizon"
+
+    classes = []
+    for c in al.CLASSES:
+        cur_pct = 100.0 * core[c] / core_total
+        diff = cur_pct - tgt[c]
+        classes.append({"key": c, "label": al.LABELS[c], "value": round(core[c], 2), "current_pct": round(cur_pct, 1),
+                        "target_pct": round(tgt[c], 1), "diff_pp": round(diff, 1), "status": _status(diff),
+                        "move": round(-diff / 100.0 * core_total, 0)})   # + = needs more, - = has too much
+
+    # fresh money: top up what is below target first, then split the rest by target
+    fresh = None
+    if req.new_money > 0:
+        final_total = core_total + req.new_money
+        need = {c: max(0.0, tgt[c] / 100.0 * final_total - core[c]) for c in al.CLASSES}
+        ns = sum(need.values())
+        if ns > req.new_money and ns > 0:
+            put = {c: need[c] * req.new_money / ns for c in al.CLASSES}
+        else:
+            spare = req.new_money - ns
+            put = {c: need[c] + spare * tgt[c] / 100.0 for c in al.CLASSES}
+        after = {c: core[c] + put[c] for c in al.CLASSES}
+        fresh = {"amount": round(req.new_money, 0),
+                 "split": [{"key": c, "label": al.LABELS[c], "put": round(put[c], 0),
+                            "after_pct": round(100.0 * after[c] / final_total, 1)} for c in al.CLASSES]}
+
+    # category gaps inside each class, against the model categories
+    cats = []
+    for c in al.CLASSES:
+        if core[c] <= 0 and tgt[c] <= 0:
+            continue
+        template = al._template(c, req.risk, req.years)
+        tw = {k: float(w) for k, w in template}
+        tsum = sum(tw.values()) or 1.0
+        have = {}
+        for r in rows:
+            if CLASS_OF.get(r["asset_class"]) == c and r["category"]:
+                have[r["category"]] = have.get(r["category"], 0.0) + r["current"]
+        for name in sorted(set(tw) | set(have), key=lambda k: -(tw.get(k, 0))):
+            cur_pct = 100.0 * have.get(name, 0.0) / core[c] if core[c] > 0 else 0.0
+            tpct = 100.0 * tw.get(name, 0.0) / tsum
+            diff = cur_pct - tpct
+            row = {"class": al.LABELS[c], "category": name, "current_pct": round(cur_pct, 1),
+                   "target_pct": round(tpct, 1), "diff_pp": round(diff, 1), "status": _status(diff),
+                   "in_model": name in tw, "candidate": None}
+            if diff < -BAND_PP and name in tw:
+                cand = al.best_in_category(c, name)
+                if cand:
+                    row["candidate"] = al.public_fund(cand)
+            cats.append(row)
+
+    summary = []
+    off = [x for x in classes if x["status"] != "On target"]
+    if not off:
+        summary.append("Your equity, hybrid and debt split is within 5 percentage points of the target.")
+    for x in off:
+        summary.append(f"{x['label']} is {abs(x['diff_pp']):.1f} points {'above' if x['diff_pp'] > 0 else 'below'} "
+                       f"target ({x['current_pct']:.1f}% against {x['target_pct']:.1f}%).")
+    if other > 0:
+        summary.append(f"Rs. {other:,.0f} in gold, silver, fund-of-funds or unclassified funds is left out of this split.")
+    return {"as_of": rev["as_of"], "source": source, "risk": req.risk, "years": req.years,
+            "core_total": round(core_total, 2), "other_total": round(other, 2), "band_pp": BAND_PP,
+            "classes": classes, "fresh_money": fresh, "categories": cats, "summary": summary,
+            "notes": ["Illustration only, not investment advice. The target is a model mix, not a personal recommendation.",
+                      "Putting new money into the lagging class moves you toward target without selling anything, "
+                      "so there is no capital gains tax or exit load.",
+                      "Selling units to rebalance can trigger tax and exit load. Check both before you act.",
+                      "A gap within 5 percentage points is treated as on target; markets move allocations all the time."]}
+
+
 class UploadRequest(BaseModel):
     filename: str
     data_base64: str
@@ -805,6 +923,10 @@ def register_portfolio_review(app):
     @app.post("/portfolio/compare")
     def portfolio_compare(req: CompareRequest):
         return compare_funds(req.names)
+
+    @app.post("/portfolio/rebalance")
+    def portfolio_rebalance(req: RebalanceRequest):
+        return build_rebalance(req)
 
     @app.post("/portfolio/pdf")
     def portfolio_pdf(req: ReviewRequest):

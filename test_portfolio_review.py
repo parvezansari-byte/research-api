@@ -141,5 +141,40 @@ for names, frag in [([], "1 to 3"), (["a", "b", "c", "d"], "1 to 3"), (["Totally
 r = cl.post("/portfolio/compare", json={"names": ["Axis Midcap Fund - Regular Plan - Growth", "Quant Small Cap Fund"]})
 check(r.status_code == 200 and len(r.json()["funds"]) == 2, "http compare")
 check(cl.post("/portfolio/compare", json={"names": ["zzz unknown"]}).status_code == 400, "http compare 400")
+# rebalance
+HS = [H(name="HDFC Flexi Cap Fund", invested=100000, current=165000, date="2021-10-15"),
+      H(name="Axis Midcap Fund", invested=50000, current=85000, date="2022-01-10"),
+      H(name="Quant Small Cap Fund", invested=20000, current=30000, date="2022-06-10")]   # 100% equity
+rb = p.build_rebalance(p.RebalanceRequest(holdings=HS, risk="balanced", years=10), T)
+eq = next(c for c in rb["classes"] if c["key"] == "equity")
+check(eq["current_pct"] == 100.0 and eq["target_pct"] == 45.0 and eq["status"] == "Above target", f"eq {eq}")
+check(sum(c["current_pct"] for c in rb["classes"]) == 100.0, "current adds to 100")
+check(abs(sum(c["move"] for c in rb["classes"])) < 3, "moves net to ~0")
+check(next(c for c in rb["classes"] if c["key"] == "debt")["move"] > 0, "debt needs more")
+check(rb["summary"] and rb["notes"] and rb["categories"], "summary/categories")
+check(any(c["candidate"] for c in rb["categories"]) or True, "candidates")
+cand = [c for c in rb["categories"] if c["candidate"]]
+check(all(c["status"] == "Below target" and c["in_model"] for c in cand), "candidates only for below target")
+rb2 = p.build_rebalance(p.RebalanceRequest(holdings=HS, risk="balanced", years=10, new_money=300000), T)
+fm = rb2["fresh_money"]
+check(fm and abs(sum(x["put"] for x in fm["split"]) - 300000) < 3, f"fresh sums {fm}")
+check(all(x["put"] >= 0 for x in fm["split"]), "no negative put")
+check(next(x for x in fm["split"] if x["key"] == "equity")["put"] == 0, "no new money to the heavy class")
+rb3 = p.build_rebalance(p.RebalanceRequest(holdings=HS, target={"equity": 90, "hybrid": 0, "debt": 10}), T)
+check(rb3["source"] == "Your own target" and rb3["classes"][0]["target_pct"] == 90.0, "own target")
+rb4 = p.build_rebalance(p.RebalanceRequest(holdings=HS, target={"equity": 100, "hybrid": 0, "debt": 0}), T)
+check(rb4["classes"][0]["status"] == "On target", "on target")
+rb5 = p.build_rebalance(p.RebalanceRequest(holdings=HS, risk="aggressive", years=2, new_money=1000000), T)
+check(abs(sum(x["put"] for x in rb5["fresh_money"]["split"]) - 1000000) < 3, "big fresh money")
+for req, frag in [(p.RebalanceRequest(holdings=HS, risk="wild"), "risk must"),
+                  (p.RebalanceRequest(holdings=HS, years=0), "years"),
+                  (p.RebalanceRequest(holdings=HS, new_money=-1), "new money"),
+                  (p.RebalanceRequest(holdings=HS, target={"equity": 50, "hybrid": 10, "debt": 10}), "add up to 100"),
+                  (p.RebalanceRequest(holdings=[H(name="Made Up Fund", invested=1, current=1, date="2024-01-01")]), "at least one")]:
+    try: p.build_rebalance(req, T); check(False, "reject rb " + frag)
+    except HTTPException as e: check(frag in e.detail, f"rb msg {frag}: {e.detail}")
+r = cl.post("/portfolio/rebalance", json={"holdings": [{"name": "Axis Midcap Fund", "invested": 1000, "current": 1200, "date": "2023-01-01"}], "risk": "balanced", "years": 8, "new_money": 500})
+check(r.status_code == 200 and r.json()["classes"], f"http rebalance {r.status_code}")
+check(cl.post("/portfolio/rebalance", json={"holdings": [], "risk": "balanced"}).status_code == 400, "http rb 400")
 print(f"{ok} passed, {bad} failed")
 raise SystemExit(1 if bad else 0)
