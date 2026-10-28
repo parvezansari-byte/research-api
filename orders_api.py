@@ -445,5 +445,9 @@ def register_orders(app, supabase_getter):
     from dhan_portfolio_api import register_dhan_portfolio
     register_dhan_portfolio(app)
 
+    # Weekly fund-fell-behind-benchmark alert (see review_watch_api.py).
+    from review_watch_api import register_review_watch
+    register_review_watch(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
