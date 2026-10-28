@@ -503,6 +503,143 @@ def parse_upload(filename: str, raw: bytes) -> dict:
             "truncated": len(rows) > MAX_HOLDINGS, "columns_found": sorted(cols)}
 
 
+# --------------------------------------------------------------------------- PDF
+def build_pdf(rev: dict, now: Optional[datetime] = None) -> bytes:
+    from fpdf import FPDF
+    _s, _inr = al._s, al._inr
+    now = now or datetime.now(IST)
+    INK, MUTED, VAULT, GOLD = (24, 36, 34), (95, 111, 108), (10, 46, 36), (201, 162, 39)
+    VC = {"Ahead": (30, 140, 80), "Behind": (200, 70, 60), "In line": (176, 133, 10)}
+
+    class Doc(FPDF):
+        def footer(self):
+            self.set_y(-12)
+            self.set_font("Helvetica", "", 7.5)
+            self.set_text_color(*MUTED)
+            self.cell(0, 5, _s("Illustration only, not investment advice. Past returns do not guarantee future returns."))
+            self.set_x(-30)
+            self.cell(18, 5, f"Page {self.page_no()}", align="R")
+
+    pdf = Doc(orientation="P", unit="mm", format="A4")
+    pdf.set_margins(12, 12, 12)
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.add_page()
+    W = 186.0
+
+    def pc(v, sign=False):
+        return "-" if v is None else (f"{v:+.1f}%" if sign else f"{v:.1f}%")
+
+    def section(title):
+        pdf.ln(4)
+        pdf.set_fill_color(*GOLD)
+        pdf.rect(12, pdf.get_y() + 1.2, 2.2, 5, "F")
+        pdf.set_x(16)
+        pdf.set_font("Helvetica", "B", 11.5)
+        pdf.set_text_color(*INK)
+        pdf.cell(0, 7.5, _s(title), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
+
+    def clip(text, width, size, style=""):
+        pdf.set_font("Helvetica", style, size)
+        t = _s(text)
+        while t and pdf.get_string_width(t) > width - 1.5:
+            t = t[:-1]
+        return t
+
+    pdf.set_fill_color(*VAULT)
+    pdf.rect(0, 0, 210, 30, "F")
+    pdf.set_xy(12, 8)
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(*GOLD)
+    pdf.cell(0, 8, "Advantage - Portfolio Review", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(12)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(220, 239, 230)
+    pdf.cell(0, 6, _s(f"As on {rev['as_of']}  -  generated {now.strftime('%d %b %Y, %I:%M %p')} IST"),
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.set_y(36)
+
+    t = rev["totals"]
+    boxes = [("Invested", _inr(t["invested"])), ("Current value", _inr(t["current"])),
+             ("Gain", f"{_inr(t['gain'])} ({pc(t['abs_pct'], True)})"),
+             ("XIRR a year", pc(t["xirr_pct"]))]
+    bw = W / 4
+    y0 = pdf.get_y()
+    for i, (k, v) in enumerate(boxes):
+        pdf.set_xy(12 + i * bw, y0)
+        pdf.set_fill_color(240, 245, 242)
+        pdf.rect(12 + i * bw + 0.8, y0, bw - 1.6, 15, "F")
+        pdf.set_xy(12 + i * bw + 2.5, y0 + 2)
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_text_color(*MUTED)
+        pdf.cell(bw - 4, 4, _s(k))
+        pdf.set_xy(12 + i * bw + 2.5, y0 + 7)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(*INK)
+        pdf.cell(bw - 4, 5, clip(v, bw - 4, 9, "B"))
+    pdf.set_y(y0 + 18)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(*INK)
+    pdf.cell(0, 5.5, _s(f"{t['funds']} funds: {t['ahead']} ahead, {t['in_line']} in line, {t['behind']} behind "
+                        "their benchmark or category"), new_x="LMARGIN", new_y="NEXT")
+
+    section("Allocation")
+    for a in rev["allocation"]["by_asset"] + rev["allocation"]["by_category"]:
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_text_color(*INK)
+        pdf.cell(52, 5, clip(a["name"], 52, 8.5))
+        x, y = pdf.get_x(), pdf.get_y()
+        pdf.set_fill_color(225, 232, 229)
+        pdf.rect(x, y + 1, 100, 3, "F")
+        pdf.set_fill_color(*GOLD)
+        pdf.rect(x, y + 1, max(0.5, a["pct"]), 3, "F")
+        pdf.set_x(x + 102)
+        pdf.cell(0, 5, f"{a['pct']:.1f}%", new_x="LMARGIN", new_y="NEXT")
+
+    section("Fund by fund")
+    cols = [("Fund", 62), ("Invested", 22), ("Current", 22), ("Total", 15), ("A year", 15), ("Peer", 15), ("Verdict", 35)]
+    pdf.set_fill_color(*VAULT)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 8)
+    for n, w in cols:
+        pdf.cell(w, 6, _s(n), fill=True)
+    pdf.ln(6)
+    for h in rev["holdings"]:
+        peer = h["benchmark_pct"] if h["benchmark_pct"] is not None else h["category_pct"]
+        vals = [clip(h["name"].split(" - ")[0], 62, 7.5), _inr(h["invested"]), _inr(h["current"]),
+                pc(h["abs_pct"], True), pc(h["cagr_pct"]), pc(peer), h["verdict"]]
+        if pdf.get_y() > 265:
+            pdf.add_page()
+        for i, ((n, w), v) in enumerate(zip(cols, vals)):
+            pdf.set_font("Helvetica", "B" if i == 6 else "", 7.5)
+            pdf.set_text_color(*(VC.get(h["verdict"], INK) if i == 6 else INK))
+            pdf.cell(w, 5.6, clip(v, w, 7.5, "B" if i == 6 else ""), border="B")
+        pdf.ln(5.6)
+        extra = [h["verdict_why"]] + h["flags"]
+        pdf.set_font("Helvetica", "", 7)
+        pdf.set_text_color(*MUTED)
+        for e in [x for x in extra if x]:
+            pdf.cell(W, 3.8, clip("   " + e, W, 7), new_x="LMARGIN", new_y="NEXT")
+        if h["benchmark"]:
+            pdf.cell(W, 3.8, clip(f"   Benchmark: {h['benchmark']} ({h['horizon'] or 'n/a'} view)", W, 7),
+                     new_x="LMARGIN", new_y="NEXT")
+
+    if rev["observations"]:
+        section("Things to notice")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(*INK)
+        for o in rev["observations"]:
+            pdf.set_x(12)
+            pdf.multi_cell(W, 5, _s("- " + o), new_x="LMARGIN", new_y="NEXT")
+    section("Notes")
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(*MUTED)
+    for n in rev["notes"]:
+        pdf.set_x(12)
+        pdf.multi_cell(W, 4.2, _s("- " + n), new_x="LMARGIN", new_y="NEXT")
+    return bytes(pdf.output())
+
+
 class UploadRequest(BaseModel):
     filename: str
     data_base64: str
@@ -524,3 +661,10 @@ def register_portfolio_review(app):
     @app.post("/portfolio/review")
     def portfolio_review(req: ReviewRequest):
         return build_review(req.holdings)
+
+    @app.post("/portfolio/pdf")
+    def portfolio_pdf(req: ReviewRequest):
+        from fastapi import Response
+        data = build_pdf(build_review(req.holdings))
+        return Response(content=data, media_type="application/pdf",
+                        headers={"Content-Disposition": 'attachment; filename="advantage_portfolio_review.pdf"'})
