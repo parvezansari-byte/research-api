@@ -27,3 +27,7 @@ create index if not exists crm_manual_holdings_client_idx
 -- As with the order tables: before real client data flows through, use the
 -- service-role key in SUPABASE_KEY and enable row level security:
 --   alter table crm_manual_holdings enable row level security;
+
+-- Average purchase date of the line (weighted by money when purchases are merged).
+-- Lets the portfolio review work out yearly returns. Safe to re-run.
+alter table crm_manual_holdings add column if not exists buy_date date;

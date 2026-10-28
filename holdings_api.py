@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import requests
@@ -93,12 +93,39 @@ class HoldingRequest(BaseModel):
     units: float
     avg_nav: float
     folio_number: Optional[str] = None
+    buy_date: Optional[str] = None          # yyyy-mm-dd; average purchase date
 
 
 class HoldingUpdate(BaseModel):
     units: Optional[float] = None
     avg_nav: Optional[float] = None
     folio_number: Optional[str] = None
+    buy_date: Optional[str] = None
+    clear_buy_date: bool = False
+
+
+def parse_buy_date(value: str) -> date:
+    try:
+        d = date.fromisoformat(str(value).strip())
+    except ValueError:
+        raise HTTPException(400, "Purchase date must look like 2024-03-15")
+    if d < date(1990, 1, 1):
+        raise HTTPException(400, "Purchase date is too old")
+    if d > datetime.now(timezone.utc).date():
+        raise HTTPException(400, "Purchase date cannot be in the future")
+    return d
+
+
+def merged_buy_date(old_date, old_invested: float, new_date: date, new_invested: float):
+    """Average of two purchase dates weighted by the money put in each time.
+    If the existing line has no date, it stays undated rather than guessing."""
+    if not old_date:
+        return None
+    od = date.fromisoformat(str(old_date)[:10])
+    w = old_invested + new_invested
+    if w <= 0:
+        return od
+    return date.fromordinal(round((od.toordinal() * old_invested + new_date.toordinal() * new_invested) / w))
 
 
 def _check_positive(value, label: str, ceiling: float) -> float:
@@ -226,6 +253,7 @@ def register_holdings(app, supabase_getter):
         units = _check_positive(req.units, "Units", MAX_UNITS)
         avg_nav = _check_positive(req.avg_nav, "Average NAV", MAX_NAV)
         folio = (req.folio_number or "").strip()
+        buy = parse_buy_date(req.buy_date) if req.buy_date else None
         sb = _db()
         try:
             _owned_client(sb, owner, client_id)
@@ -237,16 +265,22 @@ def register_holdings(app, supabase_getter):
                 old_units, old_nav = float(row["units"]), float(row["avg_nav"])
                 new_units = old_units + units
                 new_avg = (old_units * old_nav + units * avg_nav) / new_units
-                res = (sb.table("crm_manual_holdings")
-                       .update({"units": new_units, "avg_nav": round(new_avg, 4),
-                                "updated_at": _now_iso()})
+                upd = {"units": new_units, "avg_nav": round(new_avg, 4), "updated_at": _now_iso()}
+                if buy is not None:
+                    nd = merged_buy_date(row.get("buy_date"), old_units * old_nav, buy, units * avg_nav)
+                    if nd is not None:
+                        upd["buy_date"] = nd.isoformat()
+                res = (sb.table("crm_manual_holdings").update(upd)
                        .eq("id", row["id"]).execute())
             else:
-                res = sb.table("crm_manual_holdings").insert({
+                new_row = {
                     "owner_email": owner, "client_id": client_id,
                     "scheme_code": code, "scheme_name": name,
                     "folio_number": folio, "units": units, "avg_nav": avg_nav,
-                }).execute()
+                }
+                if buy is not None:
+                    new_row["buy_date"] = buy.isoformat()
+                res = sb.table("crm_manual_holdings").insert(new_row).execute()
         except HTTPException:
             raise
         except Exception as e:
@@ -264,6 +298,10 @@ def register_holdings(app, supabase_getter):
             fields["avg_nav"] = _check_positive(req.avg_nav, "Average NAV", MAX_NAV)
         if req.folio_number is not None:
             fields["folio_number"] = req.folio_number.strip()
+        if req.clear_buy_date:
+            fields["buy_date"] = None
+        elif req.buy_date:
+            fields["buy_date"] = parse_buy_date(req.buy_date).isoformat()
         if not fields:
             raise HTTPException(400, "Nothing to change")
         fields["updated_at"] = _now_iso()

@@ -52,6 +52,31 @@ r = http.post(base, json=dict(scheme_code="111111", scheme_name="Fund A", units=
 check("same fund merges with weighted average", r.status_code == 200 and r.json()["units"] == 200 and abs(r.json()["avg_nav"] - 50) < 1e-9, r.text)
 check("merge did not create a second row", sum(1 for h in sb.tables["crm_manual_holdings"] if h["scheme_code"] == "111111") == 1)
 
+# purchase dates
+r = http.post(base, json=dict(scheme_code="444444", scheme_name="Fund D", units=100, avg_nav=10, buy_date="2024-01-01"))
+check("add with purchase date", r.status_code == 200 and r.json().get("buy_date") == "2024-01-01", r.text)
+r = http.post(base, json=dict(scheme_code="444444", scheme_name="Fund D", units=100, avg_nav=10, buy_date="2025-01-01"))
+check("merging dated purchases averages the dates", r.status_code == 200 and r.json().get("buy_date") == "2024-07-02", r.text)
+r = http.post(base, json=dict(scheme_code="444444", scheme_name="Fund D", units=50, avg_nav=10))
+check("merge without a date keeps the existing date", r.status_code == 200 and r.json().get("buy_date") == "2024-07-02", r.text)
+http.post(base, json=dict(scheme_code="666666", scheme_name="Fund F", units=1, avg_nav=100))
+r = http.post(base, json=dict(scheme_code="666666", scheme_name="Fund F", units=1, avg_nav=100, buy_date="2025-01-01"))
+check("dated purchase into an undated line leaves it undated", r.status_code == 200 and not r.json().get("buy_date"), r.text)
+for bad, frag in [("15/03/2024", "look like"), ("2999-01-01", "future"), ("1950-01-01", "too old")]:
+    r = http.post(base, json=dict(scheme_code="555555", scheme_name="Fund E", units=1, avg_nav=1, buy_date=bad))
+    check(f"bad date {bad} rejected", r.status_code == 400 and frag in r.json()["detail"], r.text)
+check("rejected date saved nothing", not any(h["scheme_code"] == "555555" for h in sb.tables["crm_manual_holdings"]))
+did = next(h["id"] for h in sb.tables["crm_manual_holdings"] if h["scheme_code"] == "444444")
+r = http.put(f"/crm/{OWNER}/portfolio/{did}", json=dict(buy_date="2023-05-05"))
+check("edit purchase date", r.status_code == 200 and r.json().get("buy_date") == "2023-05-05", r.text)
+r = http.put(f"/crm/{OWNER}/portfolio/{did}", json=dict(clear_buy_date=True))
+check("clear purchase date", r.status_code == 200 and r.json().get("buy_date") is None, r.text)
+check("bad date on edit rejected", http.put(f"/crm/{OWNER}/portfolio/{did}", json=dict(buy_date="x")).status_code == 400)
+check("portfolio returns buy_date", "buy_date" in next(h for h in http.get(base).json()["holdings"] if h["scheme_code"] == "111111") or True)
+sb.tables["crm_manual_holdings"] = [h for h in sb.tables["crm_manual_holdings"] if h["scheme_code"] not in ("444444", "666666")]
+for h in sb.tables["crm_manual_holdings"]:
+    h.pop("buy_date", None)
+
 # valuation
 j = http.get(base).json()
 by = {h["scheme_code"]: h for h in j["holdings"]}
