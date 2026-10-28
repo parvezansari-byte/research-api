@@ -231,9 +231,12 @@ def xirr(flows: list) -> Optional[float]:
 # --------------------------------------------------------------------------- the review
 class Holding(BaseModel):
     name: str
-    invested: float
+    invested: Optional[float] = None      # lump sum; leave out for a SIP
     current: float
     date: Optional[str] = None
+    sip_amount: Optional[float] = None    # monthly SIP amount
+    sip_start: Optional[str] = None       # first instalment date
+    sip_end: Optional[str] = None         # last instalment date; blank = still running
 
 
 class ReviewRequest(BaseModel):
@@ -246,19 +249,57 @@ def asset_class(f: Optional[dict]) -> str:
     return ASSET.get((f.get("cat_code") or "").split("-")[0], "Other")
 
 
-def review_holding(h: Holding, today: date) -> dict:
-    inv, cur = float(h.invested), float(h.current)
+MAX_INSTALMENTS = 600
+
+
+def sip_dates(start: date, end: date) -> list:
+    """Monthly instalment dates from start to end (inclusive), on the start's day of month."""
+    out, i = [], 0
+    while len(out) < MAX_INSTALMENTS:
+        m = start.month - 1 + i
+        y, mo = start.year + m // 12, m % 12 + 1
+        last = (date(y + (mo == 12), mo % 12 + 1, 1) - timedelta(days=1)).day
+        d = date(y, mo, min(start.day, last))
+        if d > end:
+            break
+        out.append(d)
+        i += 1
+    return out
+
+
+def holding_flows(h: Holding, today: date):
+    """-> (invested, [(date, -amount)], first_date, money-weighted age in years, sip info or None)"""
+    if h.sip_amount:
+        start = parse_date(h.sip_start)
+        end = min(parse_date(h.sip_end) or today, today)
+        ds = sip_dates(start, end)
+        amt = float(h.sip_amount)
+        flows = [(d, -amt) for d in ds]
+        age = sum((today - d).days for d in ds) / len(ds) / 365.0
+        return amt * len(ds), flows, start, age, {"amount": amt, "instalments": len(ds), "start": start.isoformat(),
+                                                   "last": ds[-1].isoformat(), "running": h.sip_end is None or end >= today - timedelta(days=31)}
     d = parse_date(h.date)
+    inv = float(h.invested)
+    return inv, ([(d, -inv)] if d else []), d, ((today - d).days / 365.0 if d else None), None
+
+
+def review_holding(h: Holding, today: date) -> dict:
+    inv, flows, d, years, sip = holding_flows(h, today)
+    cur = float(h.current)
     f, score = match_fund(h.name)
     days = (today - d).days if d else None
-    years = days / 365.0 if days is not None else None
     abs_pct = round((cur / inv - 1) * 100, 2)
-    cagr = round(((cur / inv) ** (1 / years) - 1) * 100, 2) if (years and years >= 1 and cur > 0) else None
+    cagr = None
+    if years and years >= 1 and cur > 0:
+        if sip:
+            cagr = xirr(flows + [(today, cur)])
+        else:
+            cagr = round(((cur / inv) ** (1 / years) - 1) * 100, 2)
 
     out = {"name": h.name.strip(), "matched": f is not None, "match_score": score,
            "matched_name": f.get("name") if f else None, "invested": round(inv, 2), "current": round(cur, 2),
            "gain": round(cur - inv, 2), "abs_pct": abs_pct, "date": d.isoformat() if d else None, "days": days,
-           "cagr_pct": cagr, "asset_class": asset_class(f), "category": al.category_of(f) if f else None,
+           "cagr_pct": cagr, "sip": sip, "_flows": flows, "asset_class": asset_class(f), "category": al.category_of(f) if f else None,
            "benchmark": f.get("benchmark") if f else None, "plan_note": None, "horizon": None,
            "category_pct": None, "benchmark_pct": None, "fund_pct": None, "vs_category_pp": None,
            "vs_benchmark_pp": None, "verdict": "No comparison", "verdict_why": "", "expense_ratio": None,
@@ -322,7 +363,19 @@ def build_review(holdings: List[Holding], today: Optional[date] = None) -> dict:
     for i, h in enumerate(holdings, 1):
         if not h.name.strip():
             raise HTTPException(400, f"Row {i}: fund name is empty")
-        if not (math.isfinite(h.invested) and h.invested > 0):
+        if h.sip_amount:
+            if not (math.isfinite(h.sip_amount) and h.sip_amount > 0):
+                raise HTTPException(400, f"Row {i} ({h.name[:30]}): SIP amount must be above 0")
+            sd = parse_date(h.sip_start)
+            if sd is None:
+                raise HTTPException(400, f"Row {i} ({h.name[:30]}): a SIP needs its start date")
+            if sd > today:
+                raise HTTPException(400, f"Row {i} ({h.name[:30]}): the SIP start date is in the future")
+            if h.sip_end:
+                ed = parse_date(h.sip_end)
+                if ed is None or ed < sd:
+                    raise HTTPException(400, f"Row {i} ({h.name[:30]}): the SIP end date must be after the start date")
+        elif not (h.invested is not None and math.isfinite(h.invested) and h.invested > 0):
             raise HTTPException(400, f"Row {i} ({h.name[:30]}): invested value must be above 0")
         if not (math.isfinite(h.current) and h.current >= 0):
             raise HTTPException(400, f"Row {i} ({h.name[:30]}): current value cannot be negative")
@@ -336,9 +389,9 @@ def build_review(holdings: List[Holding], today: Optional[date] = None) -> dict:
 
     inv = sum(r["invested"] for r in rows)
     cur = sum(r["current"] for r in rows)
-    dated = [(parse_date(h.date), r) for h, r in zip(holdings, rows) if h.date]
-    flows = [(d, -r["invested"]) for d, r in dated if d] + [(today, sum(r["current"] for _, r in dated))]
-    longest = max((r["days"] for _, r in dated), default=0)
+    dated = [r for r in rows if r["_flows"]]
+    flows = [fl for r in dated for fl in r["_flows"]] + [(today, sum(r["current"] for r in dated))]
+    longest = max((r["days"] for r in dated), default=0)
     x = xirr(flows) if longest >= 365 else None
     totals = {"invested": round(inv, 2), "current": round(cur, 2), "gain": round(cur - inv, 2),
               "abs_pct": round((cur / inv - 1) * 100, 2), "xirr_pct": x, "funds": len(rows),
@@ -389,11 +442,13 @@ def build_review(holdings: List[Holding], today: Optional[date] = None) -> dict:
     if unmatched:
         obs.append(f"{len(unmatched)} fund(s) could not be matched to our database: {', '.join(n[:30] for n in unmatched[:3])}.")
 
+    for r in rows:
+        r.pop("_flows", None)
     return {"as_of": today.strftime("%d-%b-%Y"), "totals": totals, "holdings": rows, "allocation": alloc,
             "observations": obs[:7],
             "notes": ["Illustration only, not investment advice. Past returns do not guarantee future returns.",
-                      "Your return is annualised from the date you entered to today, treating each holding as one "
-                      "investment on that date. For SIPs, enter each instalment as its own row for an exact figure.",
+                      "A lump sum is annualised from the date you entered to today. A monthly SIP is built from its "
+                      "instalments (one a month, on the start date's day) and annualised with XIRR.",
                       "Category and benchmark figures are trailing returns (1, 3 or 5 years) for the horizon closest "
                       "to your holding period, so the comparison is approximate. Benchmark = median of the index "
                       "funds and ETFs that track it.",
@@ -615,7 +670,11 @@ def build_pdf(rev: dict, now: Optional[datetime] = None) -> bytes:
             pdf.set_text_color(*(VC.get(h["verdict"], INK) if i == 6 else INK))
             pdf.cell(w, 5.6, clip(v, w, 7.5, "B" if i == 6 else ""), border="B")
         pdf.ln(5.6)
-        extra = [h["verdict_why"]] + h["flags"]
+        sp = h.get("sip")
+        sip_line = (f"SIP {_inr(sp['amount'])} a month, {sp['instalments']} instalments since "
+                    f"{sp['start'][8:10]}-{sp['start'][5:7]}-{sp['start'][:4]}"
+                    + ("" if sp["running"] else ", stopped")) if sp else ""
+        extra = [sip_line, h["verdict_why"]] + h["flags"]
         pdf.set_font("Helvetica", "", 7)
         pdf.set_text_color(*MUTED)
         for e in [x for x in extra if x]:

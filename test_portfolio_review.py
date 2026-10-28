@@ -90,10 +90,34 @@ r = cl.post("/portfolio/review", json={"holdings": [{"name": "Axis Midcap Fund",
 check(r.status_code == 200 and r.json()["holdings"][0]["matched"], "http review")
 r = cl.post("/portfolio/review", json={"holdings": [{"name": "A", "invested": -1, "current": 1}]})
 check(r.status_code == 400, "http 400")
+# SIP
+ds = p.sip_dates(date(2026, 1, 31), date(2026, 5, 31))
+check(ds == [date(2026, 1, 31), date(2026, 2, 28), date(2026, 3, 31), date(2026, 4, 30), date(2026, 5, 31)], f"sip clamp {ds}")
+check(len(p.sip_dates(date(2023, 10, 28), T)) == 37, "sip count")
+rs = p.build_review([H(name="Axis Midcap Fund", current=480000, sip_amount=10000, sip_start="2023-10-28")], T)
+h0 = rs["holdings"][0]
+check(h0["invested"] == 370000 and h0["sip"]["instalments"] == 37 and h0["sip"]["running"], f"sip rows {h0['sip']}")
+check(h0["cagr_pct"] is not None and 15 < h0["cagr_pct"] < 40, f"sip xirr {h0['cagr_pct']}")
+check(abs(rs["totals"]["xirr_pct"] - h0["cagr_pct"]) < 0.05, "single sip: portfolio xirr = fund xirr")
+check(h0["verdict"] in ("Ahead", "In line", "Behind"), "sip verdict")
+check("_flows" not in h0, "no private field leaked")
+rs2 = p.build_review([H(name="Axis Midcap Fund", current=130000, sip_amount=10000, sip_start="2024-01-15", sip_end="2024-12-15"),
+                      H(name="Quant Small Cap Fund", invested=50000, current=70000, date="2022-01-10")], T)
+check(rs2["holdings"][0]["sip"]["instalments"] == 12 and not rs2["holdings"][0]["sip"]["running"], "ended sip")
+check(rs2["totals"]["invested"] == 170000 and rs2["totals"]["xirr_pct"] is not None, "mixed totals")
+for hs, frag in [([H(name="A", current=1, sip_amount=100)], "start date"),
+                 ([H(name="A", current=1, sip_amount=100, sip_start="2030-01-01")], "future"),
+                 ([H(name="A", current=1, sip_amount=100, sip_start="2024-01-01", sip_end="2023-01-01")], "end date"),
+                 ([H(name="A", current=1, sip_amount=-5, sip_start="2024-01-01")], "SIP amount"),
+                 ([H(name="A", current=1)], "invested value")]:
+    try: p.build_review(hs, T); check(False, "sip reject " + frag)
+    except HTTPException as e: check(frag in e.detail, f"sip msg {frag}: {e.detail}")
 rv = p.build_review([H(name="HDFC Flexi Cap Fund", invested=100000, current=165000, date="2021-10-15"),
                      H(name="Made Up ₹ Fund – x", invested=10000, current=11000, date="2023-01-01")], T)
 pdfb = p.build_pdf(rv)
 check(pdfb[:4] == b"%PDF" and len(pdfb) > 1500, "pdf bytes")
+pdfs = p.build_pdf(rs)
+check(pdfs[:4] == b"%PDF", "sip pdf")
 open("/tmp/pr_test.pdf", "wb").write(pdfb)
 r = cl.post("/portfolio/pdf", json={"holdings": [{"name": "Axis Midcap Fund", "invested": 1000, "current": 1200, "date": "2023-01-01"}]})
 check(r.status_code == 200 and r.content[:4] == b"%PDF" and r.headers["content-type"] == "application/pdf", "http pdf")
