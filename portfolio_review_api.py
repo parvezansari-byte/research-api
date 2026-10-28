@@ -699,6 +699,87 @@ def build_pdf(rev: dict, now: Optional[datetime] = None) -> bytes:
     return bytes(pdf.output())
 
 
+# --------------------------------------------------------------------------- compare
+COMPARE_ROWS = [  # (key, label, higher_is_better)
+    ("r_1y", "1 year return %", True), ("r_3y", "3 year return % a year", True), ("r_5y", "5 year return % a year", True),
+    ("r_10y", "10 year return % a year", True), ("sharpe", "Sharpe ratio", True), ("alpha", "Alpha", True),
+    ("std_dev", "Volatility (std dev)", False), ("expense_ratio", "Expense ratio %", False),
+    ("aum", "Fund size (Rs. crore)", None)]
+_BY_NAME = None
+
+
+def _resolve(name: str):
+    global _BY_NAME
+    if _BY_NAME is None:
+        _BY_NAME = {f["name"].lower(): f for f in al.load_funds()}
+    f = _BY_NAME.get(name.strip().lower())
+    return f if f else match_fund(name)[0]
+
+
+def _alternatives(f: dict, exclude: set, n: int = 3) -> list:
+    key = "r_3y" if al._num(f.get("r_3y")) is not None else "r_1y"
+    mine = al._num(f.get(key))
+    peers = [p for p in al.load_funds()
+             if p.get("cat_code") == f.get("cat_code") and p["name"] not in exclude and al.suitable(p)
+             and al.has_history(p) and (al._num(p.get("aum")) or 0) >= 500 and al._num(p.get(key)) is not None]
+    peers.sort(key=lambda p: -al._num(p.get(key)))
+    out = []
+    for p in peers[:n]:
+        d = al.public_fund(p)
+        d["basis"] = {"r_3y": "3 year", "r_1y": "1 year"}[key]
+        d["vs_selected_pp"] = round(al._num(p.get(key)) - mine, 2) if mine is not None else None
+        out.append(d)
+    return out
+
+
+def compare_funds(names: List[str]) -> dict:
+    names = [n for n in names if n and n.strip()]
+    if not 1 <= len(names) <= 3:
+        raise HTTPException(400, "Pick 1 to 3 funds to compare")
+    funds = []
+    for n in names:
+        f = _resolve(n)
+        if f is None:
+            raise HTTPException(400, f"Could not find '{n[:40]}' in the fund database. Pick it from the search list")
+        if f not in funds:
+            funds.append(f)
+    out = []
+    for f in funds:
+        cat = _group("cat", f.get("cat_code"))
+        ben = _group("bench", f.get("benchmark")) if f.get("benchmark") else None
+        peers = [al._num(p.get("r_3y")) for p in al.load_funds()
+                 if p.get("cat_code") == f.get("cat_code") and al.suitable(p) and al._num(p.get("r_3y")) is not None]
+        mine = al._num(f.get("r_3y"))
+        rank = (1 + sum(1 for v in peers if v > mine), len(peers)) if mine is not None and peers else None
+        d = {"name": f["name"], "category": al.category_of(f), "benchmark": f.get("benchmark"),
+             "manager": f.get("manager"), "inception": f.get("inception"), "top_sector": f.get("top_sector"),
+             "exit_load": (f.get("exit_load") or "")[:140], "asset_class": asset_class(f),
+             "values": {k: al._num(f.get(k)) for k, _, _ in COMPARE_ROWS},
+             "category_median": {k: (cat or {}).get(k) for k in ("r_1y", "r_3y", "r_5y", "expense")},
+             "benchmark_median": {k: (ben or {}).get(k) for k in ("r_1y", "r_3y", "r_5y")},
+             "rank_3y": {"rank": rank[0], "of": rank[1]} if rank else None}
+        out.append(d)
+    best = {}
+    if len(out) > 1:
+        for k, _, hi in COMPARE_ROWS:
+            if hi is None:
+                continue
+            vals = [(o["values"][k], i) for i, o in enumerate(out) if o["values"][k] is not None]
+            if len(vals) > 1:
+                best[k] = (max(vals) if hi else min(vals))[1]
+    ex = {f["name"] for f in funds}
+    return {"funds": out, "rows": [{"key": k, "label": l, "higher_better": h} for k, l, h in COMPARE_ROWS],
+            "best": best, "alternatives": {f["name"]: _alternatives(f, ex) for f in funds},
+            "notes": ["Returns are past trailing returns of the Regular plan. A higher past return does not mean a "
+                      "higher future return, and funds of different size, style or risk are not like for like.",
+                      "Alternatives are open-ended funds in the same category with at least Rs. 500 crore in assets, "
+                      "ranked by past return. They are not recommendations."]}
+
+
+class CompareRequest(BaseModel):
+    names: List[str]
+
+
 class UploadRequest(BaseModel):
     filename: str
     data_base64: str
@@ -720,6 +801,10 @@ def register_portfolio_review(app):
     @app.post("/portfolio/review")
     def portfolio_review(req: ReviewRequest):
         return build_review(req.holdings)
+
+    @app.post("/portfolio/compare")
+    def portfolio_compare(req: CompareRequest):
+        return compare_funds(req.names)
 
     @app.post("/portfolio/pdf")
     def portfolio_pdf(req: ReviewRequest):

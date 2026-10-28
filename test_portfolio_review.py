@@ -123,5 +123,23 @@ r = cl.post("/portfolio/pdf", json={"holdings": [{"name": "Axis Midcap Fund", "i
 check(r.status_code == 200 and r.content[:4] == b"%PDF" and r.headers["content-type"] == "application/pdf", "http pdf")
 r = cl.post("/portfolio/pdf", json={"holdings": []})
 check(r.status_code == 400, "http pdf 400")
+# compare
+c2 = p.compare_funds(["Parag Parikh Flexi Cap Fund - Regular Plan - Growth", "HDFC Flexi Cap Fund - Regular Plan - Growth"])
+check(len(c2["funds"]) == 2 and c2["funds"][0]["values"]["r_3y"] is not None, "compare funds")
+check(c2["best"]["expense_ratio"] in (0, 1) and set(c2["best"]).issubset({"r_1y", "r_3y", "r_5y", "r_10y", "sharpe", "alpha", "std_dev", "expense_ratio"}), f"best {c2['best']}")
+r3 = c2["funds"][0]["rank_3y"]
+check(r3 and 1 <= r3["rank"] <= r3["of"], "rank")
+alts = c2["alternatives"]["HDFC Flexi Cap Fund - Regular Plan - Growth"]
+check(len(alts) == 3 and all("Flexi" in a["category"] for a in alts) and all(a["aum"] >= 500 for a in alts), "alternatives")
+check(not any(a["name"].startswith(("HDFC Flexi Cap Fund - Regular", "Parag Parikh Flexi Cap Fund - Regular")) for a in alts), "alts exclude selected")
+check(alts[0]["vs_selected_pp"] is not None, "alt diff")
+c1 = p.compare_funds(["Axis Midcap"])
+check(len(c1["funds"]) == 1 and not c1["best"], "single fund")
+for names, frag in [([], "1 to 3"), (["a", "b", "c", "d"], "1 to 3"), (["Totally Unknown Fund"], "Could not find")]:
+    try: p.compare_funds(names); check(False, "reject compare")
+    except HTTPException as e: check(frag in e.detail, f"cmp msg {e.detail}")
+r = cl.post("/portfolio/compare", json={"names": ["Axis Midcap Fund - Regular Plan - Growth", "Quant Small Cap Fund"]})
+check(r.status_code == 200 and len(r.json()["funds"]) == 2, "http compare")
+check(cl.post("/portfolio/compare", json={"names": ["zzz unknown"]}).status_code == 400, "http compare 400")
 print(f"{ok} passed, {bad} failed")
 raise SystemExit(1 if bad else 0)
