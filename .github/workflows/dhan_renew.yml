@@ -1,0 +1,28 @@
+name: Renew Dhan Token
+
+# Dhan access tokens last 24 hours. This renews the token every 6 hours so it never lapses.
+# If it ever fails (for example the token already expired), GitHub emails you about the failed run.
+# Uses the same repo secret as the push tick: PUSH_TICK_SECRET.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"      # UTC, every 6 hours
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /dhan/renew
+        env:
+          TICK_SECRET: ${{ secrets.PUSH_TICK_SECRET }}
+        run: |
+          code=$(curl -s -o resp.json -w "%{http_code}" --max-time 120 \
+                 -X POST -H "X-Tick-Secret: $TICK_SECRET" \
+                 https://research-api-8a34.onrender.com/dhan/renew)
+          echo "HTTP status: $code"
+          cat resp.json; echo
+          if [ "$code" -ge 400 ] || [ "$code" -eq 000 ]; then
+            echo "Dhan token renewal failed"
+            exit 1
+          fi

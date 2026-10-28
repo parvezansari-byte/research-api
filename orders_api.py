@@ -433,6 +433,10 @@ def register_orders(app, supabase_getter):
     from watchlist_api import register_watchlist
     register_watchlist(app)
 
+    # Dhan access-token auto-renew (see dhan_token.py).
+    from dhan_token import register_dhan_token
+    register_dhan_token(app, supabase_getter)
+
     # Mutual fund portfolio review (see portfolio_review_api.py).
     from portfolio_review_api import register_portfolio_review
     register_portfolio_review(app)
