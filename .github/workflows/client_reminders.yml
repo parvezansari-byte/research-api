@@ -1,0 +1,27 @@
+name: Client Reminders
+
+# Daily at 08:30 IST: pushes "client birthday today" when there is one.
+# Uses the same PUSH_TICK_SECRET repo secret as the other workflows.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /clients/reminders/tick
+        env:
+          TICK_SECRET: ${{ secrets.PUSH_TICK_SECRET }}
+        run: |
+          code=$(curl -s -o resp.json -w "%{http_code}" --max-time 120 \
+                 -X POST -H "X-Tick-Secret: $TICK_SECRET" \
+                 https://research-api-8a34.onrender.com/clients/reminders/tick)
+          echo "HTTP status: $code"
+          cat resp.json; echo
+          if [ "$code" -ge 400 ] || [ "$code" -eq 000 ]; then
+            echo "Reminder tick failed"
+            exit 1
+          fi

@@ -453,5 +453,9 @@ def register_orders(app, supabase_getter):
     from book_summary_api import register_book_summary
     register_book_summary(app, supabase_getter)
 
+    # Birthdays and KYC reminders (see client_reminders_api.py).
+    from client_reminders_api import register_client_reminders
+    register_client_reminders(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
