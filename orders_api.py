@@ -457,5 +457,9 @@ def register_orders(app, supabase_getter):
     from client_reminders_api import register_client_reminders
     register_client_reminders(app, supabase_getter)
 
+    # Per-client capital-gains estimate (see tax_gains_api.py).
+    from tax_gains_api import register_tax_gains
+    register_tax_gains(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
