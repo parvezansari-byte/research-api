@@ -81,6 +81,31 @@ for fn, raw, frag in [("a.xls", b"x", "xls"), ("a.pdf", b"x", "Upload an"), ("a.
                       ("a.csv", b"Fund,Invested,Current\n,,\n", "No usable")]:
     try: p.parse_upload(fn, raw); check(False, "reject " + fn)
     except HTTPException as e: check(frag in e.detail, f"{fn}: {e.detail}")
+# upload with SIP columns
+wb = openpyxl.Workbook(); ws = wb.active
+ws.append(["Fund Name", "Invested Amount", "Purchase Date", "SIP Amount", "SIP Start Date", "SIP End Date", "Current Value"])
+ws.append(["HDFC Flexi Cap Fund", 100000, "15/10/2021", None, None, None, 165000])
+ws.append(["Axis Midcap Fund", None, None, 10000, "28/10/2023", None, 480000])
+ws.append(["Quant Small Cap Fund", None, None, "Rs. 5,000", date(2024, 1, 15), date(2024, 12, 15), 70000])
+ws.append(["No start SIP", None, None, 1000, None, None, 5000])
+ws.append(["Bad end SIP", None, None, 1000, "01/01/2024", "01/01/2023", 5000])
+ws.append(["Future SIP", None, None, 1000, "01/01/2030", None, 5000])
+buf = io.BytesIO(); wb.save(buf)
+u = p.parse_upload("sip.xlsx", buf.getvalue())
+names = [r["name"] for r in u["rows"]]
+check(names == ["HDFC Flexi Cap Fund", "Axis Midcap Fund", "Quant Small Cap Fund", "Bad end SIP"], f"sip upload rows {names}")
+r1 = u["rows"][1]
+check(r1["sip_amount"] == 10000 and r1["sip_start"] == "2023-10-28" and r1["sip_end"] is None and r1["current"] == 480000, f"sip row {r1}")
+check(u["rows"][2]["sip_amount"] == 5000 and u["rows"][2]["sip_end"] == "2024-12-15", "sip row with end")
+check(u["rows"][3]["sip_end"] is None and any("end date" in w for w in u["warnings"]), "bad end ignored")
+check(u["skipped"] == 2 and any("start date" in w for w in u["warnings"]) and any("future" in w for w in u["warnings"]), f"skipped {u['skipped']} {u['warnings']}")
+check("sip_amount" not in u["rows"][0], "lump sum row has no sip fields")
+rev = p.build_review([p.Holding(**{k: v for k, v in r.items() if k in ("name", "current", "date", "sip_amount", "sip_start", "sip_end") or (k == "invested" and not r.get("sip_amount"))}) for r in u["rows"]], T)
+check(len(rev["holdings"]) == 4 and rev["holdings"][1]["sip"]["instalments"] == 37, "uploaded rows go straight into a review")
+# plain "Start date" column on a SIP sheet
+txt2 = "Scheme,SIP,Start date,Current value\nAxis Midcap Fund,2000,01/01/2024,60000\n"
+u2 = p.parse_upload("b.csv", txt2.encode())
+check(u2["rows"][0]["sip_amount"] == 2000 and u2["rows"][0]["sip_start"] == "2024-01-01", f"plain start date {u2}")
 # http
 app = FastAPI(); p.register_portfolio_review(app); cl = TestClient(app)
 check(cl.get("/portfolio/funds?q=axis midcap").json()["funds"], "http search")

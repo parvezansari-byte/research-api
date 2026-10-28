@@ -462,6 +462,14 @@ def classify_header(h: str) -> Optional[str]:
     s = " ".join(s.split())
     if not s:
         return None
+    if re.search(r"\b(sip|instal\w*|monthly)\b", s):
+        if re.search(r"\b(end|ended|last|stop\w*|till|until)\b", s):
+            return "sip_end"
+        if re.search(r"\b(start|started|first|from|begin\w*|since|date)\b", s):
+            return "sip_start"
+        return "sip_amount"
+    if re.fullmatch(r"(start|from|first)( date)?|(end|last|stop|till|until)( date)?", s):
+        return "start" if s.split()[0] in ("start", "from", "first") else "end"
     if "date" in s or s in ("since", "invested on"):
         return "date"
     if any(w in s for w in ("invest", "cost", "purchase", "principal")) and "unit" not in s and "nav" not in s:
@@ -517,7 +525,7 @@ def _find_header(grid: list):
             t = classify_header(cell)
             if t and t not in cols:
                 cols[t] = j
-        if "name" in cols and ("invested" in cols or "current" in cols):
+        if "name" in cols and ("invested" in cols or "current" in cols or "sip_amount" in cols):
             return i, cols
     return None
 
@@ -539,19 +547,46 @@ def parse_upload(filename: str, raw: bytes) -> dict:
         name = str(cell("name") or "").strip()
         if not name or re.match(r"^(grand\s+)?total\b", name, re.I):
             continue
-        inv, cur = parse_money(cell("invested")), parse_money(cell("current"))
+        cur = parse_money(cell("current"))
+        sip_amt = parse_money(cell("sip_amount")) if "sip_amount" in cols else None
+        if sip_amt and sip_amt > 0:
+            if cur is None or cur < 0:
+                skipped += 1
+                warnings.append(f"Row {line_no} ({name[:30]}): a SIP row needs a current value")
+                continue
+            raw_start = cell("sip_start") if "sip_start" in cols else (cell("start") if "start" in cols else cell("date"))
+            sd = parse_date(raw_start)
+            if sd is None:
+                skipped += 1
+                warnings.append(f"Row {line_no} ({name[:30]}): a SIP row needs its start date")
+                continue
+            if sd > datetime.now(IST).date():
+                skipped += 1
+                warnings.append(f"Row {line_no} ({name[:30]}): the SIP start date is in the future")
+                continue
+            raw_end = cell("sip_end") if "sip_end" in cols else cell("end")
+            ed = parse_date(raw_end)
+            if raw_end not in (None, "") and (ed is None or ed < sd):
+                warnings.append(f"Row {line_no} ({name[:30]}): the SIP end date was not usable, so it is treated as still running")
+                ed = None
+            rows.append({"name": name, "invested": 0.0, "current": round(cur, 2), "date": None,
+                         "sip_amount": round(sip_amt, 2), "sip_start": sd.isoformat(),
+                         "sip_end": ed.isoformat() if ed else None})
+            continue
+        inv = parse_money(cell("invested"))
         if inv is None or inv <= 0 or cur is None or cur < 0:
             skipped += 1
             warnings.append(f"Row {line_no} ({name[:30]}): needs an invested value above 0 and a current value")
             continue
-        d = parse_date(cell("date"))
-        if cell("date") not in (None, "") and d is None:
+        d = parse_date(cell("date") if "date" in cols else cell("start"))
+        if "date" in cols and cell("date") not in (None, "") and d is None:
             warnings.append(f"Row {line_no} ({name[:30]}): could not read the date, so it was left blank")
         rows.append({"name": name, "invested": round(inv, 2), "current": round(cur, 2),
                      "date": d.isoformat() if d else None})
     if not rows:
-        raise HTTPException(400, "No usable rows found. Each row needs a fund name, an invested value and a current value")
-    if "date" not in cols:
+        raise HTTPException(400, "No usable rows found. Each row needs a fund name, a current value and either an invested value "
+                                 "or a SIP amount with its start date")
+    if "date" not in cols and "start" not in cols and not any(r.get("sip_amount") for r in rows):
         warnings.insert(0, "No date column found, so returns will show as absolute only. Add a Date column to compare "
                            "annualised returns.")
     return {"rows": rows[:MAX_HOLDINGS], "skipped": skipped, "warnings": warnings[:10],
