@@ -461,5 +461,9 @@ def register_orders(app, supabase_getter):
     from tax_gains_api import register_tax_gains
     register_tax_gains(app, supabase_getter)
 
+    # Goal planner (see planner_api.py).
+    from planner_api import register_planner
+    register_planner(app)
+
     from auth_guard import register_guard
     register_guard(app)
