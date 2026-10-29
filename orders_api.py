@@ -465,5 +465,9 @@ def register_orders(app, supabase_getter):
     from planner_api import register_planner
     register_planner(app)
 
+    # Client risk-profile questionnaire (see risk_profile_api.py).
+    from risk_profile_api import register_risk_profile
+    register_risk_profile(app)
+
     from auth_guard import register_guard
     register_guard(app)
