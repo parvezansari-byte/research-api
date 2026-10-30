@@ -481,5 +481,9 @@ def register_orders(app, supabase_getter):
     from risk_mismatch_api import register_risk_mismatch
     register_risk_mismatch(app, supabase_getter)
 
+    # Bulk CSV import of holdings (see holdings_import_api.py).
+    from holdings_import_api import register_holdings_import
+    register_holdings_import(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
