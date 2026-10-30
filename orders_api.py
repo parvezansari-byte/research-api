@@ -477,5 +477,9 @@ def register_orders(app, supabase_getter):
     from lookthrough_api import register_lookthrough
     register_lookthrough(app, supabase_getter)
 
+    # Risk profile vs actual mix check (see risk_mismatch_api.py).
+    from risk_mismatch_api import register_risk_mismatch
+    register_risk_mismatch(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
