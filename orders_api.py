@@ -469,5 +469,9 @@ def register_orders(app, supabase_getter):
     from risk_profile_api import register_risk_profile
     register_risk_profile(app)
 
+    # WhatsApp portfolio summary text (see summary_text_api.py).
+    from summary_text_api import register_summary_text
+    register_summary_text(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
