@@ -473,5 +473,9 @@ def register_orders(app, supabase_getter):
     from summary_text_api import register_summary_text
     register_summary_text(app, supabase_getter)
 
+    # Look-through into funds' stock holdings (see lookthrough_api.py).
+    from lookthrough_api import register_lookthrough
+    register_lookthrough(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
