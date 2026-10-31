@@ -485,5 +485,9 @@ def register_orders(app, supabase_getter):
     from holdings_import_api import register_holdings_import
     register_holdings_import(app, supabase_getter)
 
+    # Account deletion for Google Play (see account_delete_api.py).
+    from account_delete_api import register_account_delete
+    register_account_delete(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
