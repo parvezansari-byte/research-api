@@ -489,5 +489,9 @@ def register_orders(app, supabase_getter):
     from account_delete_api import register_account_delete
     register_account_delete(app, supabase_getter)
 
+    # Public privacy policy page (see privacy_api.py).
+    from privacy_api import register_privacy
+    register_privacy(app)
+
     from auth_guard import register_guard
     register_guard(app)
