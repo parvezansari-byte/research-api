@@ -497,5 +497,13 @@ def register_orders(app, supabase_getter):
     from market_report_api import register_market_report
     register_market_report(app, supabase_getter=supabase_getter)
 
+    # Daily AUM snapshots + trend (see aum_history_api.py).
+    from aum_history_api import register_aum_history
+    register_aum_history(app, supabase_getter)
+
+    # Client follow-ups (see followups_api.py).
+    from followups_api import register_followups
+    register_followups(app, supabase_getter)
+
     from auth_guard import register_guard
     register_guard(app)
