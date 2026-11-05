@@ -16,3 +16,5 @@ curl_cffi
 fpdf2
 fpdf2
 openpyxl
+matplotlib
+reportlab

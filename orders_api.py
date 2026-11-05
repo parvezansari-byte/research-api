@@ -493,5 +493,9 @@ def register_orders(app, supabase_getter):
     from privacy_api import register_privacy
     register_privacy(app)
 
+    # Daily/weekly/monthly market report PDF (see market_report_api.py).
+    from market_report_api import register_market_report
+    register_market_report(app)
+
     from auth_guard import register_guard
     register_guard(app)
