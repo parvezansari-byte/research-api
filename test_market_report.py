@@ -63,4 +63,29 @@ check(c.get("/report/market?kind=hourly").status_code == 400, "bad kind")
 m._report_cache.clear()
 app2 = FastAPI(); m.register_market_report(app2, fetch=lambda s: [], extras_fn=lambda k: {}); c2 = TestClient(app2)
 check(c2.get("/report/market.pdf").status_code == 503, "no data 503")
+# round levels give a realistic nearest resistance when the Nifty is at a 20-day high
+import time as _t
+closes = [20000 + i * 10 for i in range(300)]
+lv = m.compute_levels(closes)
+check(lv["resistance"] and lv["resistance"][0][0] <= lv["last"] * 1.02, f"near resistance {lv['resistance']}")
+check(lv["support"] and lv["support"][0][0] < lv["last"], "support below")
+# live label: IST 11:44 on a Thursday, as_of today -> label; after close or other day -> None
+epoch = _t.mktime(_t.strptime("2026-11-05 06:14", "%Y-%m-%d %H:%M")) - _t.timezone   # 06:14 UTC = 11:44 IST
+check(m.live_label(epoch, "2026-11-05") == "Intraday snapshot at 11:44 IST", f"live {m.live_label(epoch, '2026-11-05')}")
+check(m.live_label(epoch, "2026-11-04") is None, "yesterday's data is not live")
+late = epoch + 6 * 3600
+check(m.live_label(late, "2026-11-05") is None, "after close")
+sat = _t.mktime(_t.strptime("2026-11-07 06:14", "%Y-%m-%d %H:%M")) - _t.timezone
+check(m.live_label(sat, "2026-11-07") is None, "weekend")
+# fallback symbol: first empty, second returns data
+calls = []
+def fb(sym):
+    calls.append(sym)
+    return [] if sym == "^CNXMEDIA" else [("2026-11-04", 1.0)]
+got = m.fetch_all(fb, {"Media": ["^CNXMEDIA", "NIFTY_MEDIA.NS"]})
+check(got["Media"] and calls == ["^CNXMEDIA", "NIFTY_MEDIA.NS"], "fallback symbol")
+rep = m.collect("daily", fetch, extras_fn=lambda k: {}, now_str="x", live=lambda a: "Intraday snapshot at 11:44 IST")
+check(rep["live"] and rep["text"]["summary"].startswith("Intraday snapshot at 11:44 IST: the market is still open"), "live in text")
+from market_report_pdf import render_pdf
+check(render_pdf(rep, "")[:4] == b"%PDF", "live pdf renders")
 print(f"{ok} passed, {bad} failed")

@@ -32,7 +32,7 @@ LOOKBACK = {"daily": 60, "weekly": 90, "monthly": 250}     # sessions drawn on t
 INDEX_SYMS = {"NIFTY 50": "^NSEI", "SENSEX": "^BSESN", "BANK NIFTY": "^NSEBANK", "INDIA VIX": "^INDIAVIX"}
 SECTOR_SYMS = {"Bank": "^NSEBANK", "IT": "^CNXIT", "Auto": "^CNXAUTO", "Pharma": "^CNXPHARMA",
                "FMCG": "^CNXFMCG", "Metal": "^CNXMETAL", "Energy": "^CNXENERGY", "Realty": "^CNXREALTY",
-               "PSU Bank": "^CNXPSUBANK", "Media": "^CNXMEDIA", "Infra": "^CNXINFRA", "Fin Services": "^CNXFIN"}
+               "PSU Bank": "^CNXPSUBANK", "Media": ["^CNXMEDIA", "NIFTY_MEDIA.NS"], "Infra": "^CNXINFRA", "Fin Services": ["^CNXFIN", "NIFTY_FIN_SERVICE.NS"]}
 GLOBAL_SYMS = {"S&P 500": "^GSPC", "Nasdaq": "^IXIC", "Nikkei 225": "^N225", "Dollar index": "DX-Y.NYB",
                "Brent crude": "BZ=F", "Gold": "GC=F", "USD/INR": "INR=X", "US 10Y yield": "^TNX"}
 CACHE_S = 600
@@ -63,14 +63,17 @@ def fetch_yahoo(symbol: str) -> List[Tuple[str, float]]:
     return rows
 
 
-def fetch_all(fetch: Callable[[str], list], symbols: Dict[str, str]) -> Dict[str, list]:
+def fetch_all(fetch: Callable[[str], list], symbols: Dict[str, object]) -> Dict[str, list]:
     def one(item):
-        name, sym = item
-        try:
-            return name, fetch(sym)
-        except Exception as e:
-            log.warning("history %s failed: %s", sym, e)
-            return name, []
+        name, syms = item
+        for sym in ([syms] if isinstance(syms, str) else syms):     # first symbol that returns data wins
+            try:
+                rows = fetch(sym)
+                if rows:
+                    return name, rows
+            except Exception as e:
+                log.warning("history %s failed: %s", sym, e)
+        return name, []
     with ThreadPoolExecutor(max_workers=8) as ex:
         return dict(ex.map(one, symbols.items()))
 
@@ -100,6 +103,15 @@ def live_extras(kind: str) -> dict:
 
 
 # ---------------------------------------------------------------- number helpers
+def live_label(now_epoch: float, as_of: str) -> Optional[str]:
+    """'Intraday snapshot at 11:44 IST' while the NSE session is open and as_of is today's date, else None."""
+    ist = time.gmtime(now_epoch + 19800)
+    mins = ist.tm_hour * 60 + ist.tm_min
+    if ist.tm_wday < 5 and 9 * 60 + 15 <= mins < 15 * 60 + 45 and as_of == time.strftime("%Y-%m-%d", ist):
+        return f"Intraday snapshot at {ist.tm_hour:02d}:{ist.tm_min:02d} IST"
+    return None
+
+
 def pct_change(series: list, k: int) -> Optional[float]:
     if len(series) <= k:
         return None
@@ -141,8 +153,12 @@ def compute_levels(closes: list) -> dict:
     lv = {"last": last, "dma20": sma(closes, 20), "dma50": sma(closes, 50), "dma200": sma(closes, 200),
           "hi20": max(closes[-20:]), "lo20": min(closes[-20:]), "hi52": max(win), "lo52": min(win)}
     lv["from_hi_pct"] = (last / lv["hi52"] - 1) * 100
+    step = 500 if last >= 40000 else 250 if last >= 10000 else 100 if last >= 2000 else 50
+    base = int(last // step) * step
     cands = [("20-day high", lv["hi20"]), ("52-week high", lv["hi52"]), ("20-day average", lv["dma20"]),
-             ("50-day average", lv["dma50"]), ("200-day average", lv["dma200"]), ("20-day low", lv["lo20"])]
+             ("50-day average", lv["dma50"]), ("200-day average", lv["dma200"]), ("20-day low", lv["lo20"]),
+             ("round level", base), ("round level", base + step), ("round level", base + 2 * step),
+             ("round level", base - step)]
     above, below = [], []
     for name, v in cands:
         if v is None:
@@ -150,13 +166,16 @@ def compute_levels(closes: list) -> dict:
         (above if v > last * 1.0005 else below if v < last * 0.9995 else []).append((v, name))
     above.sort()
     below.sort(reverse=True)
+    # a named technical level beats a round number when the two sit within 0.4% of each other
+    above.sort(key=lambda x: (x[0], x[1] == "round level"))
+    below.sort(key=lambda x: (-x[0], x[1] == "round level"))
     dedup = lambda xs: [x for i, x in enumerate(xs) if all(abs(x[0] - y[0]) / x[0] > 0.004 for y in xs[:i])]
     lv["resistance"] = dedup(above)[:2]
     lv["support"] = dedup(below)[:2]
     return lv
 
 
-def build_text(kind: str, d: dict) -> dict:
+def build_text(kind: str, d: dict, live: Optional[str] = None) -> dict:
     when = {"daily": "today", "weekly": "this week", "monthly": "this month"}[kind]
     n = d["indices"]["NIFTY 50"]
     nif = f"The Nifty 50 {verb(n['pct'])} {abs(n['pct']):.2f}% {when} to {num(n['last'])}"
@@ -170,6 +189,8 @@ def build_text(kind: str, d: dict) -> dict:
         summary = clauses[0] + "."
     else:
         summary = ", ".join(clauses[:-1]) + " and " + clauses[-1] + "."
+    if live:
+        summary = f"{live}: the market is still open, so these are not final closing figures. " + summary
     sec = d["sectors"]
     if len(sec) >= 2:
         best, worst = sec[0], sec[-1]
@@ -177,7 +198,7 @@ def build_text(kind: str, d: dict) -> dict:
                     f"{sum(1 for _, p in sec if p > 0)} of {len(sec)} sectors we track ended higher.")
     vix = d["indices"].get("INDIA VIX")
     if vix:
-        summary += f" India VIX, the market's fear gauge, closed at {num(vix['last'])}."
+        summary += f" India VIX, the market's fear gauge, is at {num(vix['last'])}."
     lv = d["levels"]
     if lv["dma200"]:
         pos = "above" if lv["last"] > lv["dma200"] else "below"
@@ -249,7 +270,7 @@ def build_text(kind: str, d: dict) -> dict:
     return {"summary": summary, "global": gl, "scenarios": scen, "guidance": guide, "takeaway": " ".join(take)}
 
 
-def analyse(kind: str, hist: Dict[str, list], extras: dict, now_str: str) -> dict:
+def analyse(kind: str, hist: Dict[str, list], extras: dict, now_str: str, live: Optional[str] = None) -> dict:
     k = KINDS[kind]
     nifty = hist.get("NIFTY 50") or []
     if len(nifty) < k + 20:
@@ -273,8 +294,10 @@ def analyse(kind: str, hist: Dict[str, list], extras: dict, now_str: str) -> dic
             glob[name] = {"last": s[-1][1], "pct": pct_change(s, k), "chg": s[-1][1] - s[-1 - k][1]}
     closes = [c for _, c in nifty]
     look = min(LOOKBACK[kind], len(nifty))
+    if callable(live):
+        live = live(nifty[-1][0])
     out = {
-        "kind": kind, "title": TITLES[kind], "generated": now_str,
+        "kind": kind, "title": TITLES[kind], "generated": now_str, "live": live,
         "as_of": nifty[-1][0], "base_date": nifty[-1 - k][0], "sessions": k,
         "indices": indices, "sectors": sectors, "global": glob, "levels": compute_levels(closes),
         "chart": {"dates": [d for d, _ in nifty[-look:]], "close": closes[-look:],
@@ -288,7 +311,7 @@ def analyse(kind: str, hist: Dict[str, list], extras: dict, now_str: str) -> dic
         s = s[-look:]
         if len(s) > 2:
             out["compare"][name] = {"dates": [d for d, _ in s], "rebased": [c / s[0][1] * 100 for _, c in s]}
-    out["text"] = build_text(kind, out)
+    out["text"] = build_text(kind, out, live)
     missing = [n for n in list(SECTOR_SYMS) if not any(n == s[0] for s in sectors)]
     missing += [n for n in GLOBAL_SYMS if n not in glob]
     missing += [n for n in INDEX_SYMS if n not in indices]
@@ -300,13 +323,14 @@ def analyse(kind: str, hist: Dict[str, list], extras: dict, now_str: str) -> dic
     return out
 
 
-def collect(kind: str, fetch: Callable = fetch_yahoo, extras_fn: Callable = live_extras, now_str: str = "") -> dict:
+def collect(kind: str, fetch: Callable = fetch_yahoo, extras_fn: Callable = live_extras, now_str: str = "",
+            live=None) -> dict:
     syms = {}
     syms.update(INDEX_SYMS)
     syms.update({"sec:" + n: s for n, s in SECTOR_SYMS.items()})
     syms.update({"g:" + n: s for n, s in GLOBAL_SYMS.items()})
     hist = fetch_all(fetch, syms)
-    return analyse(kind, hist, extras_fn(kind), now_str)
+    return analyse(kind, hist, extras_fn(kind), now_str, live)
 
 
 def register_market_report(app, fetch: Callable = fetch_yahoo, extras_fn: Callable = live_extras):
@@ -318,7 +342,8 @@ def register_market_report(app, fetch: Callable = fetch_yahoo, extras_fn: Callab
         if hit and now - hit[0] < CACHE_S:
             return hit[1]
         try:
-            rep = collect(kind, fetch, extras_fn=extras_fn, now_str=time.strftime("%d %B %Y, %H:%M IST", time.gmtime(now + 19800)))
+            rep = collect(kind, fetch, extras_fn=extras_fn, now_str=time.strftime("%d %B %Y, %H:%M IST", time.gmtime(now + 19800)),
+                          live=lambda as_of: live_label(now, as_of))
         except ValueError as e:
             raise HTTPException(503, str(e))
         except Exception as e:

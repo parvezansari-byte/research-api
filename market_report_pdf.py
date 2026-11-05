@@ -209,7 +209,7 @@ def _make_doc(buf, rep):
         c.drawString(18 * mm, h - 40 * mm, title)
         c.setFont("DV", 7.5)
         c.setFillColor(colors.HexColor("#B8C2D6"))
-        span = {"daily": "Latest session versus the one before",
+        span = {"daily": rep.get("live") and f"{rep['live']} - not a closing report" or "Latest session versus the one before",
                 "weekly": f"Last 5 sessions, since the close of {_short(rep['base_date'])}",
                 "monthly": f"Last 21 sessions, since the close of {_short(rep['base_date'])}"}[rep["kind"]]
         c.drawString(18 * mm, h - 47 * mm, span)
@@ -318,7 +318,8 @@ def render_pdf(rep: dict, note: str = "") -> bytes:
     f.append(Spacer(1, 4))
     f.append(_kpis(rep, st, fw))
     k = rep["sessions"]
-    f.append(P(f"Moves shown are for the {'latest session' if k == 1 else f'last {k} sessions'}. Index levels are closing values; "
+    lvl = "intraday levels (the market is open)" if rep.get("live") else "closing values"
+    f.append(P(f"Moves shown are for the {'latest session' if k == 1 else f'last {k} sessions'}. Index levels are {lvl}; "
                "the US 10-year yield is shown as a level, with the change in basis points in the text.", st["small"]))
     n = 1
 
@@ -414,6 +415,8 @@ def render_pdf(rep: dict, note: str = "") -> bytes:
                            P(escape(str((b or {}).get("name") or (b or {}).get("symbol", ""))), st["cell"]),
                            P(f"<font color='{H_RED}'>{b['change_pct']:+.2f}</font>" if b and b.get("change_pct") is not None else "", st["cell"])])
             f.append(_table(tb, [fw * 0.34, fw * 0.16, fw * 0.34, fw * 0.16]))
+            if mv.get("note"):
+                f.append(P(escape(str(mv["note"])), st["small"]))
 
     # outlook
     head("Outlook: bull, base and bear")
@@ -436,6 +439,9 @@ def render_pdf(rep: dict, note: str = "") -> bytes:
     f.append(Spacer(1, 8))
     miss = rep.get("missing") or []
     notes = ("<b>Data notes.</b> Prices are from Yahoo Finance and may be delayed; breadth, movers and FII/DII (daily report) are from NSE. "
+             "Brent and gold are front-month futures contracts and can differ from spot quotes by a few dollars. "
+             "FII/DII figures are for the previous completed session until NSE publishes the day's data. "
+             "Round-number levels are shown because they often act as support or resistance. "
              "The text is generated from the numbers and does not explain the news behind the moves." +
              (f" Not available when this report was made: {escape(', '.join(miss))}." if miss else ""))
     f.append(P(notes, st["small"]))
