@@ -1,0 +1,44 @@
+name: Market Report
+
+# After the close: builds the daily report (Mon-Fri 16:30 IST), the weekly one (Friday 17:00 IST) and the
+# monthly one (checked every weekday 17:30 IST; the server only acts on the last weekday of the month).
+# Each run saves that day's FII/DII figures and pushes a short summary to the owner.
+# Uses the same PUSH_TICK_SECRET repo secret as the other workflows.
+
+on:
+  schedule:
+    - cron: "0 11 * * 1-5"      # 16:30 IST daily
+    - cron: "30 11 * * 5"       # 17:00 IST Friday weekly
+    - cron: "0 12 * * 1-5"      # 17:30 IST: monthly candidate (server skips unless month-end)
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "daily, weekly or monthly"
+        default: "daily"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /report/tick
+        env:
+          TICK_SECRET: ${{ secrets.PUSH_TICK_SECRET }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_KIND: ${{ github.event.inputs.kind }}
+        run: |
+          case "$SCHEDULE" in
+            "30 11 * * 5") kind=weekly ;;
+            "0 12 * * 1-5") kind=monthly ;;
+            "0 11 * * 1-5") kind=daily ;;
+            *) kind="${INPUT_KIND:-daily}" ;;
+          esac
+          echo "kind: $kind"
+          code=$(curl -s -o resp.json -w "%{http_code}" --max-time 170 \
+                 -X POST -H "X-Tick-Secret: $TICK_SECRET" \
+                 "https://research-api-8a34.onrender.com/report/tick?kind=$kind")
+          echo "HTTP status: $code"
+          cat resp.json; echo
+          if [ "$code" -ge 400 ] || [ "$code" -eq 000 ]; then
+            echo "Report tick failed"
+            exit 1
+          fi

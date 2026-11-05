@@ -1,4 +1,4 @@
-import datetime, math, random
+import datetime, json, math, os, random
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import market_report_api as m
@@ -88,4 +88,61 @@ rep = m.collect("daily", fetch, extras_fn=lambda k: {}, now_str="x", live=lambda
 check(rep["live"] and rep["text"]["summary"].startswith("Intraday snapshot at 11:44 IST: the market is still open"), "live in text")
 from market_report_pdf import render_pdf
 check(render_pdf(rep, "")[:4] == b"%PDF", "live pdf renders")
+# ---- FII/DII log
+rows1 = [{"who": "FII", "date": "03-Nov-2026", "net": 6837.0}, {"who": "DII", "date": "03-Nov-2026", "net": -3679.0}]
+log = m.update_flow_log([], rows1)
+check(log == [{"d": "2026-11-03", "fii": 6837.0, "dii": -3679.0}], f"log1 {log}")
+check(m.update_flow_log(log, rows1) == log, "idempotent per date")
+rows2 = [{"who": "FII", "date": "04-Nov-2026", "net": 7284.0}, {"who": "DII", "date": "04-Nov-2026", "net": -3712.0}]
+log2 = m.update_flow_log(log, rows2)
+sm = m.flow_summary(log2)
+check(sm["latest"]["d"] == "2026-11-04" and sm["last5"] == {"fii": 14121.0, "dii": -7391.0, "n": 2} and sm["mtd"]["n"] == 2, f"summary {sm}")
+check(m.flow_summary([]) is None and m.update_flow_log(log2, [{"who": "FII", "date": "bad", "net": 1}]) == log2, "bad rows ignored")
+log3 = log2 + [{"d": "2026-12-01", "fii": 1.0, "dii": 2.0}]
+check(m.flow_summary(log3)["mtd"]["n"] == 1, "month to date resets")
+check(len(m.update_flow_log([{"d": f"2026-01-{i:02d}", "fii": 1, "dii": 1} for i in range(1, 29)] * 4, rows1)) <= m.FLOW_KEEP, "log capped")
+check(m.is_last_weekday_of_month(__import__("datetime").date(2026, 10, 30)) and not m.is_last_weekday_of_month(__import__("datetime").date(2026, 10, 29))
+      and m.is_last_weekday_of_month(__import__("datetime").date(2026, 7, 31)) and not m.is_last_weekday_of_month(__import__("datetime").date(2026, 8, 28)), "last weekday")
+# ---- daily report records flows and exposes totals; weekly report reuses the log
+import push_api
+from fake_supabase import FakeSb
+sb = FakeSb()
+sent = []
+push_api.send_to_email = lambda sb_, e, t, b, data=None, kind=None: (sent.append((e, t, b, data, kind)) or {"sent": 1})
+import os
+asof = m.collect("daily", fetch, extras_fn=lambda k: {}, now_str="x")["as_of"]
+def at(day, hhmm="11:30"):          # epoch for HH:MM UTC on `day`  (11:30 UTC = 17:00 IST)
+    return _t.mktime(_t.strptime(f"{day} {hhmm}", "%Y-%m-%d %H:%M")) - _t.timezone
+state = {"t": at(asof)}
+m._report_cache.clear()
+app3 = FastAPI()
+m.register_market_report(app3, fetch=fetch, extras_fn=lambda k: EXTRAS if k == "daily" else {"breadth": None, "movers": None, "fii": None},
+                         supabase_getter=lambda: sb, now_fn=lambda: state["t"])
+c3 = TestClient(app3)
+os.environ["PUSH_TICK_SECRET"] = "s"
+H = {"X-Tick-Secret": "s"}
+check(c3.post("/report/tick").status_code == 403, "tick needs secret")
+check(c3.post("/report/tick?kind=hourly", headers=H).status_code == 400, "tick bad kind")
+r = c3.post("/report/tick?kind=daily", headers=H).json()
+check(r.get("title") == "Daily Market Report ready" and "Nifty" in r["body"] and "FII +6,837 cr" in r["body"], f"daily tick {r}")
+check(len(sent) == 1 and sent[0][3] == {"type": "report", "kind": "daily"}, "one push sent")
+check(c3.post("/report/tick?kind=daily", headers=H).json().get("skipped") == "already sent today" and len(sent) == 1, "once per day")
+check(push_api.state_get(sb, m.FLOW_KEY) is not None and json.loads(push_api.state_get(sb, m.FLOW_KEY))[0]["fii"] == 6837.0, "flows recorded in push_state")
+# a later day with no new session (holiday): data still ends on `asof`
+state["t"] = at(__import__("datetime").date.fromisoformat(asof).isoformat() and "2026-11-20")
+r = c3.post("/report/tick?kind=daily", headers=H).json()
+check("no new session" in r.get("skipped", ""), f"holiday {r}")
+# weekly report shows the recorded flows; PDF renders them
+m._report_cache.clear()
+rep = c3.get("/report/market?kind=weekly").json()
+check(rep["flows"] and rep["flows"]["latest"]["d"] == "2026-11-03", f"weekly flows {rep.get('flows')}")
+pdfr = c3.get("/report/market.pdf?kind=weekly")
+check(pdfr.status_code == 200 and pdfr.content[:4] == b"%PDF", "weekly pdf with flows")
+open("/tmp/mr_weekly_flows.pdf", "wb").write(pdfr.content)
+# monthly tick only on the last weekday of the month
+state["t"] = at("2026-10-29")
+check(c3.post("/report/tick?kind=monthly", headers=H).json().get("skipped") == "not the last weekday of the month", "monthly skipped mid-month")
+state["t"] = at("2026-10-30")
+rm = c3.post("/report/tick?kind=monthly", headers=H).json()
+check(rm.get("title") == "Monthly Market Report ready", f"monthly {rm}")
 print(f"{ok} passed, {bad} failed")

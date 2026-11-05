@@ -308,6 +308,22 @@ def _box(flow, bg, bar):
     return t
 
 
+def _flows_table(rep, st, fw):
+    fl = rep.get("flows")
+    if not fl:
+        return None
+    last = fl["latest"]
+    import datetime as _dt
+    mon = _dt.date.fromisoformat(last["d"]).strftime("%b")
+    heads = [P("₹ crore (recorded)", st["th"]), P(f"{_short(last['d'])}", st["th"]),
+             P(f"Last {fl['last5']['n']} session{'s' if fl['last5']['n'] != 1 else ''}", st["th"]), P(f"{mon} to date ({fl['mtd']['n']})", st["th"])]
+    cell = lambda v: P(f"<font color='{_c(v)}'><b>{v:+,.0f}</b></font>", st["cell"])
+    rows = [heads,
+            [P("FII net", st["cellb"]), cell(last["fii"]), cell(fl["last5"]["fii"]), cell(fl["mtd"]["fii"])],
+            [P("DII net", st["cellb"]), cell(last["dii"]), cell(fl["last5"]["dii"]), cell(fl["mtd"]["dii"])]]
+    return _table(rows, [fw * 0.28, fw * 0.24, fw * 0.24, fw * 0.24])
+
+
 def render_pdf(rep: dict, note: str = "") -> bytes:
     _register_fonts()
     st = _styles()
@@ -393,6 +409,12 @@ def render_pdf(rep: dict, note: str = "") -> bytes:
             if fl:
                 f.append(Spacer(1, 4))
                 f.append(fl)
+            ft = _flows_table(rep, st, fw)
+            if ft is not None and rep["flows"]["mtd"]["n"] >= 2:
+                f.append(Spacer(1, 6))
+                f.append(ft)
+                f.append(P("Totals add up only the sessions this app has recorded, so they are lower than the exchange totals until "
+                           "the record is complete.", st["small"]))
             f.append(P(f"Provisional figures, source: {escape(rep['fii'].get('source', 'NSE'))}. Foreign money leading while "
                        "domestic funds sell makes a rally depend more on global factors such as crude and the dollar.", st["small"]))
         if rep.get("breadth"):
@@ -417,6 +439,14 @@ def render_pdf(rep: dict, note: str = "") -> bytes:
             f.append(_table(tb, [fw * 0.34, fw * 0.16, fw * 0.34, fw * 0.16]))
             if mv.get("note"):
                 f.append(P(escape(str(mv["note"])), st["small"]))
+
+    if rep["kind"] != "daily":
+        ft = _flows_table(rep, st, fw)
+        if ft is not None:
+            head("FII / DII activity")
+            f.append(ft)
+            f.append(P("Totals add up only the sessions this app has recorded (the daily report saves each day's NSE figures), "
+                       "so they can be lower than the exchange totals. Provisional figures.", st["small"]))
 
     # outlook
     head("Outlook: bull, base and bear")

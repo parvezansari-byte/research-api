@@ -14,13 +14,17 @@ The text is generated from the numbers by fixed rules - it states what moved and
 recent support/resistance sits. It does NOT explain WHY markets moved (news); the optional
 `note` is where the adviser adds that commentary, and it is printed in its own box.
 """
+import hmac
+import json
 import logging
+import os
 import threading
 import time
+from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Header
 from fastapi.responses import Response
 
 log = logging.getLogger("market_report_api")
@@ -100,6 +104,87 @@ def live_extras(kind: str) -> dict:
     except Exception as e:
         log.warning("fii/dii failed: %s", e)
     return out
+
+
+# ---------------------------------------------------------------- FII / DII log
+FLOW_KEY = "fii_dii_log"          # push_state row: JSON list of {"d": "YYYY-MM-DD", "fii": net, "dii": net}
+FLOW_KEEP = 90
+
+
+def parse_flow_date(s) -> Optional[str]:
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(str(s).strip(), fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def update_flow_log(log: list, rows: list) -> list:
+    """Add (or replace) the day in `rows` (NSE FII/DII rows) and return the new log."""
+    net = {r.get("who"): r.get("net") for r in rows if r.get("net") is not None}
+    d = next((parse_flow_date(r.get("date")) for r in rows if parse_flow_date(r.get("date"))), None)
+    if d is None or "FII" not in net or "DII" not in net:
+        return log
+    new = [e for e in log if e.get("d") != d] + [{"d": d, "fii": float(net["FII"]), "dii": float(net["DII"])}]
+    new.sort(key=lambda e: e["d"])
+    return new[-FLOW_KEEP:]
+
+
+def flow_summary(log: list) -> Optional[dict]:
+    """Latest day, last 5 recorded sessions and month-to-date, from the days this app has recorded."""
+    if not log:
+        return None
+    last = log[-1]
+    l5 = log[-5:]
+    mtd = [e for e in log if e["d"][:7] == last["d"][:7]]
+    s = lambda es, k: sum(e[k] for e in es)
+    return {"latest": last,
+            "last5": {"fii": s(l5, "fii"), "dii": s(l5, "dii"), "n": len(l5)},
+            "mtd": {"fii": s(mtd, "fii"), "dii": s(mtd, "dii"), "n": len(mtd)}}
+
+
+def attach_flows(rep: dict, sb) -> None:
+    """Record today's flows (daily report) and attach the running totals. Never raises."""
+    rep["flows"] = None
+    if sb is None:
+        return
+    try:
+        import push_api
+        log = json.loads(push_api.state_get(sb, FLOW_KEY) or "[]")
+        fii = rep.get("fii")
+        if fii and fii.get("rows"):
+            new = update_flow_log(log, fii["rows"])
+            if new != log:
+                push_api.state_set(sb, FLOW_KEY, json.dumps(new))
+                log = new
+        rep["flows"] = flow_summary(log)
+    except Exception as e:
+        log_ = logging.getLogger("market_report_api")
+        log_.warning("flow log failed: %s", e)
+
+
+def is_last_weekday_of_month(d: date) -> bool:
+    nxt = d + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    return nxt.month != d.month
+
+
+def push_text(rep: dict) -> tuple:
+    ix = rep["indices"]
+    n = ix["NIFTY 50"]
+    when = {"daily": "today", "weekly": "this week", "monthly": "this month"}[rep["kind"]]
+    parts = [f"Nifty {sgn(n['pct'])} to {num(n['last'])} {when}"]
+    if "SENSEX" in ix:
+        parts.append(f"Sensex {sgn(ix['SENSEX']['pct'])}")
+    if "BANK NIFTY" in ix:
+        parts.append(f"Bank Nifty {sgn(ix['BANK NIFTY']['pct'])}")
+    body = " | ".join(parts)
+    fl = (rep.get("flows") or {}).get("latest")
+    if rep["kind"] == "daily" and fl:
+        body += f". FII {fl['fii']:+,.0f} cr, DII {fl['dii']:+,.0f} cr"
+    return f"{TITLES[rep['kind']]} ready", body
 
 
 # ---------------------------------------------------------------- number helpers
@@ -333,7 +418,14 @@ def collect(kind: str, fetch: Callable = fetch_yahoo, extras_fn: Callable = live
     return analyse(kind, hist, extras_fn(kind), now_str, live)
 
 
-def register_market_report(app, fetch: Callable = fetch_yahoo, extras_fn: Callable = live_extras):
+def register_market_report(app, fetch: Callable = fetch_yahoo, extras_fn: Callable = live_extras,
+                           supabase_getter: Optional[Callable] = None, now_fn: Callable = time.time):
+    def _sb():
+        try:
+            return supabase_getter() if supabase_getter else None
+        except Exception:
+            return None
+
     def get(kind: str) -> dict:
         if kind not in KINDS:
             raise HTTPException(400, "kind must be daily, weekly or monthly")
@@ -349,8 +441,39 @@ def register_market_report(app, fetch: Callable = fetch_yahoo, extras_fn: Callab
         except Exception as e:
             log.exception("report failed")
             raise HTTPException(502, f"Could not build the report: {e}")
+        attach_flows(rep, _sb())
         _report_cache[(kind,)] = (now, rep)
         return rep
+
+    @app.post("/report/tick")
+    def report_tick(kind: str = "daily", force: bool = False, x_tick_secret: str = Header(default="")):
+        """Cron: build the report after the close, record FII/DII, and push a summary to the owner."""
+        import push_api
+        secret = os.environ.get("PUSH_TICK_SECRET", "")
+        if not secret:
+            raise HTTPException(503, "PUSH_TICK_SECRET is not set on the server")
+        if not hmac.compare_digest(x_tick_secret.encode(), secret.encode()):
+            raise HTTPException(403, "Bad tick secret")
+        if kind not in KINDS:
+            raise HTTPException(400, "kind must be daily, weekly or monthly")
+        sb = _sb()
+        if sb is None:
+            raise HTTPException(500, "Database not configured on the server")
+        ist = time.gmtime(now_fn() + 19800)
+        today = date(ist.tm_year, ist.tm_mon, ist.tm_mday)
+        if kind == "monthly" and not force and not is_last_weekday_of_month(today):
+            return {"skipped": "not the last weekday of the month"}
+        key = f"market_report_sent_{kind}"
+        if not force and push_api.state_get(sb, key) == today.isoformat():
+            return {"skipped": "already sent today"}
+        _report_cache.pop((kind,), None)
+        rep = get(kind)
+        if kind == "daily" and not force and rep["as_of"] != today.isoformat():
+            return {"skipped": f"no new session today (latest data is {rep['as_of']})"}
+        title, body = push_text(rep)
+        sent = push_api.send_to_email(sb, push_api.OWNER_EMAIL, title, body, {"type": "report", "kind": kind}, kind="report")
+        push_api.state_set(sb, key, today.isoformat())
+        return {"kind": kind, "as_of": rep["as_of"], "title": title, "body": body, "push": sent}
 
     @app.get("/report/market")
     def report_json(kind: str = "daily"):
