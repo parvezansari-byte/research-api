@@ -324,7 +324,7 @@ def _flows_table(rep, st, fw):
     return _table(rows, [fw * 0.28, fw * 0.24, fw * 0.24, fw * 0.24])
 
 
-def render_pdf(rep: dict, note: str = "") -> bytes:
+def render_pdf(rep: dict, note: str = "", brief: dict = None) -> bytes:
     _register_fonts()
     st = _styles()
     buf = io.BytesIO()
@@ -350,6 +350,36 @@ def render_pdf(rep: dict, note: str = "") -> bytes:
         f.append(_box(P("<b>Adviser's note.</b> " + escape(note).replace("\n", "<br/>"), st["box"]), AMBER_BG, GOLD))
         f.append(Spacer(1, 6))
     f.append(chart_trend(rep))
+
+    if brief:
+        tn = brief["tone"]
+        bg, fg = {"red": (RED_BG, H_RED), "green": (GREEN_BG, H_TEAL)}.get(tn["colour"], (AMBER_BG, "#B7791F"))
+        head("Market tone, flows and headlines")
+        lines = f"<font color='{fg}'><b>Overall tone: {escape(tn['label'])}</b></font><br/>{escape(tn['note'])}"
+        if brief.get("flow_line"):
+            lines += f"<br/><b>Institutional flows:</b> {escape(brief['flow_line'])}"
+        f.append(_box(P(lines, st["box"]), bg, colors.HexColor(fg)))
+        f.append(P("The tone is a plain label computed from the index and volatility moves above. It is not a prediction.", st["small"]))
+        if brief.get("news"):
+            f.append(Spacer(1, 4))
+            rows = [[P("Headline", st["th"]), P("Source", st["th"]), P("Impact", st["th"])]]
+            for nw in brief["news"]:
+                t = escape(str(nw.get("title", "")))
+                link = str(nw.get("link") or "")
+                if link.startswith("http"):
+                    t = f"<link href='{escape(link, {chr(39): '&#39;'})}' color='#1F4E8C'>{t}</link>"
+                sent = str(nw.get("sentiment") or "")
+                col = H_TEAL if sent.lower().startswith("pos") else H_RED if sent.lower().startswith("neg") else "#555555"
+                rows.append([P(t, st["cell"]),
+                             P(f"{escape(str(nw.get('source', '')))}<br/>{escape(str(nw.get('age', '')))}", st["cell"]),
+                             P(f"{escape(str(nw.get('impact', '')))}<br/><font color='{col}'>{escape(sent)}</font>", st["cell"])])
+            f.append(_table(rows, [fw * 0.62, fw * 0.22, fw * 0.16]))
+            f.append(P("Real headlines from the app's news feeds, ranked by impact then recency. Sentiment is a keyword label.", st["small"]))
+        if brief.get("ai"):
+            f.append(Spacer(1, 4))
+            txt = escape(brief["ai"]).replace("**", "")
+            f.append(_box(P("<b>AI commentary.</b> " + txt.replace("\n", "<br/>"), st["box"]), colors.HexColor("#EEF3FA"), NAVY))
+            f.append(P("Written by an AI model from the numbers and headlines in this report only. It can be wrong and is not advice.", st["small"]))
 
     if rep["global"]:
         head("Global cues")
@@ -472,7 +502,7 @@ def render_pdf(rep: dict, note: str = "") -> bytes:
              "Brent and gold are front-month futures contracts and can differ from spot quotes by a few dollars. "
              "FII/DII figures are for the previous completed session until NSE publishes the day's data. "
              "Round-number levels are shown because they often act as support or resistance. "
-             "The text is generated from the numbers and does not explain the news behind the moves." +
+             "The market text is generated from the numbers and does not explain the news behind the moves; headlines and AI commentary, when shown, are in their own sections." +
              (f" Not available when this report was made: {escape(', '.join(miss))}." if miss else ""))
     f.append(P(notes, st["small"]))
     f.append(P("<b>Disclaimer.</b> This update is for information only. It is not investment, tax or legal advice. Scenario levels are "

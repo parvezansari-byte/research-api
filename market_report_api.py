@@ -419,7 +419,45 @@ def collect(kind: str, fetch: Callable = fetch_yahoo, extras_fn: Callable = live
 
 
 def register_market_report(app, fetch: Callable = fetch_yahoo, extras_fn: Callable = live_extras,
-                           supabase_getter: Optional[Callable] = None, now_fn: Callable = time.time):
+                           supabase_getter: Optional[Callable] = None, now_fn: Callable = time.time,
+                           news_fn: Optional[Callable] = None, ai_fn: Optional[Callable] = None,
+                           post: Optional[Callable] = None):
+    import market_report_brief as brief_mod
+    news_fn = news_fn or brief_mod.default_news
+    ai_fn = ai_fn or brief_mod.default_ai
+    _last_user_mail: Dict[str, float] = {}
+
+    def get_brief(rep: dict) -> dict:
+        b = rep.get("_brief")
+        if b is None:
+            b = brief_mod.build_brief(rep, news_fn, ai_fn)
+            rep["_brief"] = b
+        return b
+
+    def make_pdf(rep: dict, note: str = "") -> bytes:
+        from market_report_pdf import render_pdf
+        if not _render_slots.acquire(timeout=20):
+            raise HTTPException(503, "Busy building other reports. Try again in a minute.")
+        try:
+            return render_pdf(rep, note, get_brief(rep))
+        finally:
+            _render_slots.release()
+
+    def email_all(rep: dict, sb, kind: str, to: Optional[str] = None, note: str = "") -> list:
+        addrs = [to] if to else brief_mod.recipients(sb, kind)
+        if not addrs:
+            return []
+        pdf = make_pdf(rep, note)
+        out = []
+        for a in addrs:
+            try:
+                brief_mod.send_email(rep, get_brief(rep), pdf, a, post)
+                out.append({"to": a, "ok": True})
+            except Exception as e:
+                log.warning("email to %s failed: %s", a, e)
+                out.append({"to": a, "ok": False, "error": str(e)[:200]})
+        return out
+
     def _sb():
         try:
             return supabase_getter() if supabase_getter else None
@@ -446,7 +484,7 @@ def register_market_report(app, fetch: Callable = fetch_yahoo, extras_fn: Callab
         return rep
 
     @app.post("/report/tick")
-    def report_tick(kind: str = "daily", force: bool = False, x_tick_secret: str = Header(default="")):
+    def report_tick(kind: str = "daily", force: bool = False, email: bool = True, x_tick_secret: str = Header(default="")):
         """Cron: build the report after the close, record FII/DII, and push a summary to the owner."""
         import push_api
         secret = os.environ.get("PUSH_TICK_SECRET", "")
@@ -473,24 +511,59 @@ def register_market_report(app, fetch: Callable = fetch_yahoo, extras_fn: Callab
         title, body = push_text(rep)
         sent = push_api.send_to_email(sb, push_api.OWNER_EMAIL, title, body, {"type": "report", "kind": kind}, kind="report")
         push_api.state_set(sb, key, today.isoformat())
-        return {"kind": kind, "as_of": rep["as_of"], "title": title, "body": body, "push": sent}
+        mailed = []
+        mkey = f"market_report_emailed_{kind}"
+        if email and (force or push_api.state_get(sb, mkey) != today.isoformat()):
+            try:
+                mailed = email_all(rep, sb, kind)
+            except Exception as e:
+                log.warning("email step failed: %s", e)
+                mailed = [{"ok": False, "error": str(e)[:200]}]
+            push_api.state_set(sb, mkey, today.isoformat())
+        return {"kind": kind, "as_of": rep["as_of"], "title": title, "body": body, "push": sent, "email": mailed}
+
+    @app.post("/report/email-all")
+    def report_email_all(kind: str = "daily", to: str = "", x_tick_secret: str = Header(default="")):
+        """Admin/cron: email the report now (to one address with ?to=, else to every opted-in user)."""
+        secret = os.environ.get("PUSH_TICK_SECRET", "")
+        if not secret:
+            raise HTTPException(503, "PUSH_TICK_SECRET is not set on the server")
+        if not hmac.compare_digest(x_tick_secret.encode(), secret.encode()):
+            raise HTTPException(403, "Bad tick secret")
+        if kind not in KINDS:
+            raise HTTPException(400, "kind must be daily, weekly or monthly")
+        rep = get(kind)
+        return {"kind": kind, "as_of": rep["as_of"], "email": email_all(rep, _sb(), kind, to.strip() or None)}
+
+    @app.post("/report/{email}/email")
+    def report_email_me(email: str, kind: str = "daily", note: str = ""):
+        """App button: email the report to the signed-in user (the path holds the user's email, so auth_guard
+        checks the login token). One e-mail per minute per address."""
+        email = email.strip()
+        if "@" not in email or len(email) > 200:
+            raise HTTPException(400, "Bad email")
+        if kind not in KINDS:
+            raise HTTPException(400, "kind must be daily, weekly or monthly")
+        now = time.time()
+        if now - _last_user_mail.get(email.lower(), 0) < 60:
+            raise HTTPException(429, "Please wait a minute before sending another email.")
+        _last_user_mail[email.lower()] = now
+        rep = get(kind)
+        res = email_all(rep, _sb(), kind, email, note.strip()[:1500])
+        if not res or not res[0]["ok"]:
+            raise HTTPException(502, (res[0].get("error") if res else "Could not send") or "Could not send")
+        return {"sent": True, "to": email, "kind": kind, "as_of": rep["as_of"]}
 
     @app.get("/report/market")
     def report_json(kind: str = "daily"):
         rep = get(kind)
-        slim = {k: v for k, v in rep.items() if k not in ("chart", "compare")}
+        slim = {k: v for k, v in rep.items() if k not in ("chart", "compare", "_brief")}
         return slim
 
     @app.get("/report/market.pdf")
     def report_pdf(kind: str = "daily", note: str = ""):
         rep = get(kind)
-        from market_report_pdf import render_pdf
-        if not _render_slots.acquire(timeout=20):
-            raise HTTPException(503, "Busy building other reports. Try again in a minute.")
-        try:
-            pdf = render_pdf(rep, note.strip()[:1500])
-        finally:
-            _render_slots.release()
+        pdf = make_pdf(rep, note.strip()[:1500])
         name = f"advantage_{kind}_market_report_{rep['as_of']}.pdf"
         return Response(pdf, media_type="application/pdf",
                         headers={"Content-Disposition": f'inline; filename="{name}"'})

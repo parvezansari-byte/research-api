@@ -146,3 +146,86 @@ state["t"] = at("2026-10-30")
 rm = c3.post("/report/tick?kind=monthly", headers=H).json()
 check(rm.get("title") == "Monthly Market Report ready", f"monthly {rm}")
 print(f"{ok} passed, {bad} failed")
+
+# ---------------------------------------------------------------- v4: brief, PDF and email
+import market_report_brief as b
+from fake_supabase import FakeSb
+
+NEWS = [{"title": "RBI holds repo rate; markets rally", "source": "ET Markets", "sentiment": "Positive", "impact": "High", "age": "2h ago", "link": "https://example.com/a?x=1&y=2"},
+        {"title": "Crude jumps <fast> on supply fears", "source": "Mint", "sentiment": "Negative", "impact": "Medium", "age": "5h ago", "link": "https://example.com/b"}]
+AI = "**Snapshot** Mixed session.\nFlows: FII bought."
+daily = m.collect("daily", fetch, extras_fn=lambda k: EXTRAS, now_str="4 November 2026, 20:30 IST")
+t = b.tone(daily); check(t["label"] in ("MIXED / NEUTRAL", "RISK-ON", "RISK-OFF"), "tone label")
+fake = {"indices": {"NIFTY 50": {"pct": -2}, "SENSEX": {"pct": -1.8}, "BANK NIFTY": {"pct": -2.2}, "INDIA VIX": {"pct": 8}}}
+check(b.tone(fake)["label"] == "RISK-OFF", "risk-off")
+fake["indices"]["INDIA VIX"]["pct"] = -9; fake["indices"] = {k: ({"pct": 2} if k != "INDIA VIX" else v) for k, v in fake["indices"].items()}
+check(b.tone(fake)["label"] == "RISK-ON", "risk-on")
+check(b.tone({"indices": {}})["label"] == "MIXED / NEUTRAL", "tone empty")
+ft = b.flow_totals(daily); check(ft and ft["fii_net_total"] == 6837 and ft["total_days"] == 1, "flow totals daily")
+br = b.build_brief(daily, lambda n: NEWS, lambda r, n: AI)
+check(br["news"] == NEWS and br["ai"] == AI and "6,837" in br["flow_line"], "brief content")
+br_bad = b.build_brief(daily, lambda n: 1 / 0, lambda r, n: 1 / 0)
+check(br_bad["news"] == [] and br_bad["ai"] is None, "brief survives failures")
+subj, body = b.email_parts(daily, br)
+check(subj.startswith("Advantage - Daily Market Report (") and daily["as_of"] in subj and "\n" not in subj, "subject")
+check("RBI holds repo rate" in body and "not investment advice" in body and "FII net" in body, "body")
+from market_report_pdf import render_pdf
+pdf = render_pdf(daily, "", br)
+check(pdf[:4] == b"%PDF", "pdf with brief")
+pdf0 = render_pdf(daily, "", None); check(pdf0[:4] == b"%PDF", "pdf without brief")
+open("test_report3.pdf", "wb").write(pdf)
+try:
+    from pypdf import PdfReader
+    txt = " ".join(pg.extract_text() for pg in PdfReader("test_report3.pdf").pages)
+    check("Overall tone" in txt and "Crude jumps" in txt and "AI commentary" in txt, "pdf has brief text")
+    txt0 = " ".join(pg.extract_text() for pg in PdfReader("test_report2.pdf").pages) if os.path.exists("test_report2.pdf") else ""
+except ImportError:
+    print("pypdf missing, text check skipped")
+
+class Resp:
+    def __init__(self, c=201, t="ok"): self.status_code, self.text = c, t
+sent = []
+def post_ok(url, **kw): sent.append(kw["json"]); return Resp()
+os.environ["BREVO_API_KEY"] = "k"; os.environ["EMAIL_SENDER"] = "s@x.in"; os.environ["EMAIL_RECIPIENT"] = "admin@x.in, ADMIN@x.in"
+b.send_email(daily, br, pdf, "u@x.in", post_ok)
+check(sent[0]["to"] == [{"email": "u@x.in"}] and sent[0]["attachment"][0]["name"].endswith(".pdf") and sent[0]["sender"]["email"] == "s@x.in", "payload")
+try:
+    b.send_email(daily, br, pdf, "u@x.in", lambda u, **k: Resp(400, "bad")); check(False, "should raise")
+except RuntimeError:
+    check(True, "raises on 400")
+os.environ.pop("BREVO_API_KEY")
+try:
+    b.send_email(daily, br, pdf, "u@x.in", post_ok); check(False, "no key raise")
+except RuntimeError:
+    check(True, "raises without key")
+os.environ["BREVO_API_KEY"] = "k"
+
+sb = FakeSb()
+sb.table("alert_settings").insert({"user_email": "a@x.in", "daily": True, "weekly": False}).execute()
+sb.table("alert_settings").insert({"user_email": "b@x.in", "daily": False, "weekly": True}).execute()
+check(b.recipients(sb, "daily") == ["a@x.in", "admin@x.in"], f"recipients {b.recipients(sb, 'daily')}")
+
+# routes
+app = FastAPI()
+sent.clear()
+m._report_cache.clear()
+m.register_market_report(app, fetch, extras_fn=lambda k: EXTRAS, supabase_getter=lambda: sb, now_fn=lambda: 1793900000,
+                         news_fn=lambda n: NEWS, ai_fn=lambda r, n: AI, post=post_ok)
+c = TestClient(app)
+os.environ["PUSH_TICK_SECRET"] = "sec"
+r = c.post("/report/email-all?kind=daily"); check(r.status_code == 403, "email-all needs secret")
+r = c.post("/report/email-all?kind=daily", headers={"X-Tick-Secret": "sec"})
+check(r.status_code == 200 and [x["to"] for x in r.json()["email"]] == ["a@x.in", "admin@x.in"] and len(sent) == 2, f"email-all {r.status_code} {r.text[:200]}")
+sent.clear()
+r = c.post("/report/email-all?kind=daily&to=one@x.in", headers={"X-Tick-Secret": "sec"})
+check(len(sent) == 1 and sent[0]["to"][0]["email"] == "one@x.in", "email-all single")
+r = c.post("/report/me@x.in/email?kind=daily"); check(r.status_code == 200 and r.json()["sent"], f"me {r.status_code} {r.text[:100]}")
+r = c.post("/report/me@x.in/email?kind=daily"); check(r.status_code == 429, "rate limit")
+r = c.post("/report/bad/email?kind=daily"); check(r.status_code == 400, "bad email")
+r = c.get("/report/market?kind=daily"); check("_brief" not in r.json(), "json hides brief")
+r = c.get("/report/market.pdf?kind=daily"); check(r.status_code == 200 and r.content[:4] == b"%PDF", "pdf route")
+def post_fail(url, **kw): return Resp(500, "boom")
+app2 = FastAPI(); m._report_cache.clear()
+m.register_market_report(app2, fetch, extras_fn=lambda k: EXTRAS, supabase_getter=lambda: sb, news_fn=lambda n: NEWS, ai_fn=lambda r, n: None, post=post_fail)
+r = TestClient(app2).post("/report/you@x.in/email?kind=daily"); check(r.status_code == 502, "send failure -> 502")
+print("v4 done", ok, bad)

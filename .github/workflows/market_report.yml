@@ -2,7 +2,8 @@ name: Market Report
 
 # After the close: builds the daily report (Mon-Fri 16:30 IST), the weekly one (Friday 17:00 IST) and the
 # monthly one (checked every weekday 17:30 IST; the server only acts on the last weekday of the month).
-# Each run saves that day's FII/DII figures and pushes a short summary to the owner.
+# Each run saves that day's FII/DII figures, pushes a short summary to the owner and e-mails the PDF to everyone opted in
+# (alert_settings daily/weekly/monthly) plus EMAIL_RECIPIENT. Needs BREVO_API_KEY and EMAIL_SENDER on Render.
 # Uses the same PUSH_TICK_SECRET repo secret as the other workflows.
 
 on:
